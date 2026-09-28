@@ -3,6 +3,7 @@
 Create a Jira ticket with the label `ai-agent` and this service fixes it: it clones the repo, has an LLM (via [Aider](https://aider.chat)) make the change, pushes a branch, opens a pull request with a written description, and comments the PR link back on the ticket. Everything runs on free tiers (Jira Free, GitHub Free, Render Free, Groq).
 
 For a step-by-step explanation of what happens during a run, see [docs/how-it-works.md](docs/how-it-works.md).
+Setting up on another computer: [docs/setup-new-machine.md](docs/setup-new-machine.md).
 
 ```
 Jira ticket (label ai-agent)
@@ -55,6 +56,7 @@ Example:
 | `scripts/send_test_webhook.py` | Send a signed, Jira-shaped webhook for a ticket |
 | `docs/how-it-works.md` | The flow step by step: what each step does and why |
 | `docs/known-issues.md` | Limitations, past fixes, troubleshooting |
+| `docs/setup-new-machine.md` | Step-by-step setup on another laptop |
 
 ## Configuration
 

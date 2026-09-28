@@ -79,6 +79,7 @@ class Job:
     files: list[str] = field(default_factory=list)
     tokens: dict[str, int] = field(default_factory=lambda: {"sent": 0, "received": 0})
     pr_url: str | None = None
+    jira_status: str | None = None  # last status the agent moved the ticket to
     detail: str | None = None  # skip reason or error message
     _t0: float = 0.0
 

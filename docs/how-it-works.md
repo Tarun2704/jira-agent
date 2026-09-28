@@ -60,12 +60,13 @@ The request is acknowledged but ignored (`"accepted": false`) when:
 
 *Why the last rule:* Jira also sends `issue_updated` for comments. The agent writes comments, so reacting to every update would make it trigger itself in a loop.
 
-### Step 4: Avoid duplicates and queue the job
+### Step 4: Save the ticket to the queue and queue the job
+- The agent adds the label **`ai-agent-queued`** to the ticket (`_set_queue_label`). This is the queue's persistent copy: it lives in Jira, so it survives a Render restart (see [Surviving a restart](#surviving-a-restart)). It's removed when the job ends.
 - `_in_flight` holds the ticket keys that are queued or running. If the key is already there, the event is ignored (Jira sometimes sends the same event twice).
 - The job is submitted to a **single-worker thread pool**, so only one ticket is processed at a time. The free Render instance has 512 MB RAM and Groq's free tier is rate-limited, so running jobs in parallel would cause failures.
 - The endpoint replies **202 Accepted** straight away.
 
-Note: the queue lives in memory. If Render restarts, queued jobs are lost (see [known issues](known-issues.md)).
+Adding the queue label (and moving the ticket's status later) makes Jira send more `issue_updated` webhooks. They're ignored by the Step 3 rule, because they don't newly add `ai-agent`.
 
 ---
 
@@ -87,6 +88,8 @@ The label is checked again here, in case it was removed between the webhook and 
 Jira comment: **🤖 Coding agent picked this up. Working on branch `ai/CA-2-replace-deprecated-dash-imports`...**
 
 The branch name is `ai/` + ticket key + the title turned into a short slug (`branch_name()`).
+
+The ticket is moved to **In Progress** (`JIRA_STATUS_IN_PROGRESS`). Status moves are best-effort: if the workflow has no such status, a warning is logged with the statuses that exist, and the job carries on.
 
 ### Step 8: Prepare a fresh copy of the repo
 1. Ask GitHub for the repo's default branch (e.g. `main`).
@@ -157,10 +160,24 @@ Jira: https://<site>.atlassian.net/browse/CA-2
 - **Draft** when `OPEN_DRAFT_PR=true`, so it can't be merged by accident. GitHub Free only allows drafts on public repos; for a private repo the agent retries as a normal PR.
 
 ### Step 18: Report back to Jira
-Jira comment: **🤖 Pull request opened: \<link\>**, plus **What changed:** and the summary.
+Jira comment: **🤖 Pull request opened: \<link\>**, plus **What changed:** and the summary. The ticket is moved to **In Review** (`JIRA_STATUS_IN_REVIEW`).
 
 ### Step 19: Clean up
-Whether the job succeeded or failed, the cloned repo and temp files are deleted (`finally:` block), and the ticket key is removed from `_in_flight`.
+Whether the job succeeded or failed, the cloned repo and temp files are deleted (`finally:` block), the ticket key is removed from `_in_flight`, and the `ai-agent-queued` label is removed.
+
+---
+
+## Surviving a restart
+
+Render restarts the service on every deploy, and may restart it at other times. Anything held only in memory is lost, so the queue is also kept in Jira:
+
+1. **Accepted:** the ticket gets the `ai-agent-queued` label (Step 4).
+2. **Finished** (any outcome): the label is removed (Step 19).
+3. **Restarted mid-queue or mid-job:** the label is still there. **2 minutes after startup** (`RECOVERY_DELAY_SECONDS`), `recover_queued()` searches Jira for `labels = "ai-agent-queued"` and queues those tickets again, with event `recovered_after_restart`. The job starts from scratch; a half-done run is safe to repeat (fresh clone, force-pushed agent branch, and the open-PR check in Step 6).
+
+*Why wait 2 minutes:* during a deploy, Render starts the new instance **before** stopping the old one, and gives the old one ~30 seconds to finish. Searching immediately could pick up a ticket the old instance is still working on and run it twice. After 2 minutes, the old job has either finished (label removed) or been stopped (label kept, so it's correctly recovered).
+
+This covers tickets the agent had **received**. A webhook that never arrived (e.g. sent while the service was down) isn't covered: re-add the `ai-agent` label or replay it with `scripts/send_test_webhook.py`.
 
 ---
 
@@ -172,19 +189,21 @@ Every step is logged with the job's tag (e.g. `[CA-3#1a2b3c4d]`) and timed; `/jo
 Any error in Steps 5–18 (bad token, network failure, Aider timeout, Git error) is caught by `handle_issue()`. It:
 1. logs the full error in Render's **Logs** tab,
 2. comments **🤖 Coding agent failed:** on the ticket with the last part of the error, with the GitHub token removed,
-3. still runs the clean-up.
+3. moves the ticket back to **To Do** (`JIRA_STATUS_ON_FAILURE`; also used when the agent made no changes),
+4. still runs the clean-up.
 
 To retry: fix the cause, then remove and re-add the `ai-agent` label.
 
 ## What you see in Jira
 
-| Comment | Meaning |
-|---|---|
-| 🤖 Coding agent picked this up… | Job started (Step 7) |
-| 🤖 Pull request opened: … What changed: … | Success (Step 18) |
-| 🤖 Coding agent finished but made no changes… | The model didn't edit anything; make the ticket more specific (Step 13) |
-| 🤖 Skipped: a pull request for this ticket is already open… | Close or merge that PR first (Step 6) |
-| 🤖 Coding agent failed: … | Error; see the message and Render logs |
+| Comment | Status | Label | Meaning |
+|---|---|---|---|
+| *(none yet)* | unchanged | `ai-agent-queued` added | Accepted, waiting in the queue (Step 4) |
+| 🤖 Coding agent picked this up… | **In Progress** | `ai-agent-queued` | Job started (Step 7) |
+| 🤖 Pull request opened: … What changed: … | **In Review** | removed | Success (Step 18) |
+| 🤖 Coding agent finished but made no changes… | **To Do** | removed | The model didn't edit anything; make the ticket more specific (Step 13) |
+| 🤖 Skipped: a pull request for this ticket is already open… | unchanged | removed | Close or merge that PR first (Step 6) |
+| 🤖 Coding agent failed: … | **To Do** | removed | Error; see the message and Render logs |
 
 ## Where the secrets live and how they're protected
 

@@ -36,7 +36,9 @@ It needs the `WEBHOOK_SECRET` (the token is hidden as `token=***` in the logs). 
   | `steps` | Seconds per step: `fetch_ticket`, `check_open_pr`, `clone`, `aider`, `describe`, `commit_push`, `create_pr` |
   | `files` | Files named in the ticket and handed to Aider |
   | `tokens` | LLM tokens used (Aider + PR description) |
+  | `event` | `jira:issue_created`, `jira:issue_updated`, or `recovered_after_restart` |
   | `pr_url` | The PR opened (or the already-open PR if skipped) |
+  | `jira_status` | Last status the agent moved the ticket to |
   | `detail` | Why it was skipped, or the error if it failed |
 
 - **`webhooks`**: the last 100 webhook deliveries, each with `outcome` (`accepted`, `ignored`, `rejected`) and `reason`
@@ -70,6 +72,9 @@ What problems look like:
 | `Webhook ignored: ... reason=missing label 'ai-agent'` | Ticket lacks the label. |
 | `Webhook ignored: ... reason=ignored event 'jira:issue_updated' ...` | Normal: an edit or comment, not a trigger. |
 | `Webhook ignored: ... reason=already queued` | Duplicate delivery while the ticket was already being worked on. |
+| `Startup recovery: N ticket(s) re-queued from Jira label 'ai-agent-queued': [...]` | Logged ~2 min after every start; lists tickets resumed after a restart (usually 0). |
+| `WARNING ... Jira status 'In Review' not available for CA-3 (available: [...])` | That status isn't in the workflow; add it on the board or change `JIRA_STATUS_IN_REVIEW`. |
+| `WARNING ... Could not add label 'ai-agent-queued'` | Jira call failed; the job still runs but won't survive a restart. |
 | `Skipped: PR already open` | Close/merge that PR, then re-add the label. |
 | `Aider made no changes. Output tail: ...` | Ticket too vague; the tail shows what the model said. |
 | `WARNING ... PR description generation failed` | LLM call failed (often rate limits); PR still opened with a basic description. |

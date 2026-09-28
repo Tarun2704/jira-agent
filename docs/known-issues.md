@@ -7,7 +7,8 @@ Things to know when running the Jira coding agent: current limitations, problems
 | Issue | Impact | Workaround |
 |---|---|---|
 | **Render free tier sleeps** after ~15 min idle | First ticket after a quiet spell waits 30–60s while the service wakes up. Jira retries if the first delivery times out. | None needed. For always-on, move to an Oracle Cloud Always Free VM or a paid Render instance. |
-| **Queue is in memory** | If Render restarts or redeploys mid-job, that ticket is dropped silently. | Remove and re-add the `ai-agent` label to rerun it. |
+| **Recovered jobs restart from scratch** | After a restart, a ticket cut off mid-run is re-queued ~2 minutes later and repeated from the beginning (a second "picked this up" comment). | Expected. If the label `ai-agent-queued` is stuck on a ticket that isn't running, remove it by hand. |
+| **Status moves need matching statuses** | The agent moves tickets to "In Progress", "In Review" and back to "To Do". A status that doesn't exist in the project's workflow is skipped with a warning in the logs. | Add the missing column on the board, or change `JIRA_STATUS_*` on Render. Set one to empty to disable that move. |
 | **One job at a time** | Several tickets created together are handled one after another. | Expected on the 512 MB free instance; don't raise the worker count there. |
 | **Vague tickets fail** | "Improve the code" gives poor or no edits. | Name the file(s) and describe the expected behaviour. Tickets that name a file get that file handed to Aider directly. |
 | **Free LLM limits** | Groq's free tier is rate-limited. Free tiers may log or train on prompts. | Only point the agent at code you're fine sending to the provider. Switch provider with `AIDER_MODEL` + its API key. |
@@ -43,6 +44,7 @@ Kept here so they aren't reintroduced.
 | Renamed ticket could get a duplicate PR | The open-PR check matched the full branch name, which includes the ticket title. | Open PRs are matched by ticket key. |
 | Rerun failed if the old PR's branch still existed | A fresh branch from `main` can't be pushed over the leftover `ai/KEY-...` branch without force. | The agent force-pushes its own `ai/` branches (safe: only reached when no PR for the ticket is open). |
 | No way to tell why a ticket was ignored | Ignored webhooks weren't logged, and there was no job history. | Every webhook is logged with its outcome and reason; `/jobs` shows recent jobs and deliveries ([observability.md](observability.md)). |
+| Restart lost queued/running tickets | The queue was only in memory. | The queue is also kept in Jira as the `ai-agent-queued` label; labelled tickets are re-queued after startup. |
 | Weak PR descriptions | The PR body was just a diff stat and log tail. | An extra LLM call writes Summary / Changes / How to verify from the real diff (`app/pr_writer.py`). |
 
 ## Troubleshooting

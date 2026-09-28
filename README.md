@@ -40,6 +40,8 @@ Example:
 | Any other edit or comment | Ignored (so its own comments can't re-trigger it) |
 | Ticket already has an open agent PR | Skipped, with a Jira comment linking the PR |
 
+While it works, the agent moves the ticket **To Do → In Progress → In Review** (or back to **To Do** if it failed or changed nothing), and marks queued tickets with the label `ai-agent-queued` so they're resumed after a restart. Details in [docs/how-it-works.md](docs/how-it-works.md).
+
 **To rerun a ticket:** close or merge its PR, then remove and re-add the `ai-agent` label.
 
 ## Layout
@@ -75,6 +77,9 @@ Copy `.env.example` to `.env` and fill it in. `.env` is gitignored; never commit
 | `AIDER_EDIT_FORMAT` | `diff` (default, edits only needed lines) or `whole` |
 | `WEBHOOK_SECRET` | Random string; must match the Secret in the Jira webhook |
 | `TRIGGER_LABEL` | Default `ai-agent` |
+| `QUEUE_LABEL` | Default `ai-agent-queued`; marks queued/running tickets so they survive restarts (empty = off) |
+| `RECOVERY_DELAY_SECONDS` | Default `120`; wait after startup before resuming queued tickets |
+| `JIRA_STATUS_IN_PROGRESS` / `JIRA_STATUS_IN_REVIEW` / `JIRA_STATUS_ON_FAILURE` | Defaults `In Progress` / `In Review` / `To Do` (empty = don't move) |
 | `OPEN_DRAFT_PR` | Default `true` |
 
 Check everything with:

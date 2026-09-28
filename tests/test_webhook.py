@@ -24,11 +24,13 @@ def client(monkeypatch):
     from app import config, main
 
     config.get_settings.cache_clear()
-    submitted = []
+    submitted, labels = [], []
     monkeypatch.setattr(main._executor, "submit", lambda fn, job: submitted.append(job.issue_key))
+    monkeypatch.setattr(main, "_set_queue_label", lambda key, present: labels.append((key, present)))
     main._in_flight.clear()
-    c = TestClient(main.app)
+    c = TestClient(main.app)  # not used as a context manager, so startup recovery doesn't run
     c.submitted = submitted
+    c.queue_labels = labels
     return c
 
 

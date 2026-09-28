@@ -1,25 +1,78 @@
 """FastAPI webhook receiver: Jira -> queue -> coding agent."""
+import asyncio
 import hashlib
 import hmac
 import logging
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request
 
 from app.agent import CodingAgent
 from app.config import get_settings
+from app.jira_client import JiraClient
 from app.jobs import Job, current_job, setup_logging, store
 
 setup_logging()
 log = logging.getLogger("jira-agent")
 
-app = FastAPI(title="Jira Coding Agent")
-
 # One job at a time: free instances have little RAM, and LLM free tiers are rate-limited.
 _executor = ThreadPoolExecutor(max_workers=1)
 _in_flight: set[str] = set()
 _lock = threading.Lock()
+
+
+def _jira() -> JiraClient:
+    return JiraClient(get_settings())
+
+
+def _set_queue_label(key: str, present: bool) -> None:
+    """Persist the queue in Jira: the label marks tickets queued or running.
+
+    Best-effort: if Jira is unreachable the job still runs, it just won't survive a restart.
+    """
+    label = get_settings().queue_label
+    if not label:
+        return
+    try:
+        jira = _jira()
+        (jira.add_label if present else jira.remove_label)(key, label)
+    except Exception:
+        log.warning("Could not %s label %r on %s", "add" if present else "remove", label, key, exc_info=True)
+
+
+def recover_queued() -> list[str]:
+    """Re-queue tickets that still carry the queue label (their job was cut off by a restart)."""
+    label = get_settings().queue_label
+    if not label:
+        return []
+    try:
+        keys = _jira().search_keys(f'labels = "{label}" ORDER BY created ASC')
+    except Exception:
+        log.warning("Startup recovery: could not search Jira for label %r", label, exc_info=True)
+        return []
+    recovered = [k for k in keys if _enqueue(k, "recovered_after_restart")]
+    log.info("Startup recovery: %d ticket(s) re-queued from Jira label %r: %s", len(recovered), label, recovered)
+    return recovered
+
+
+def _recover_after_delay() -> None:
+    # During a deploy Render starts the new instance before stopping the old one (which
+    # gets ~30s to finish). Waiting avoids re-queuing a ticket the old instance is still
+    # working on; by then it has either finished (label removed) or been stopped (label kept).
+    time.sleep(get_settings().recovery_delay_seconds)
+    recover_queued()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    threading.Thread(target=_recover_after_delay, name="recover-queued", daemon=True).start()
+    yield
+
+
+app = FastAPI(title="Jira Coding Agent", lifespan=lifespan)
 
 
 def _verify(request: Request, body: bytes, secret: str) -> bool:
@@ -58,10 +111,24 @@ def _run_job(job: Job) -> None:
     try:
         CodingAgent(get_settings(), job).handle_issue(job.issue_key)
     finally:
+        _set_queue_label(job.issue_key, present=False)
         log.info("Job finished: %s", job.summary())
         current_job.reset(ctx)
         with _lock:
             _in_flight.discard(job.issue_key)
+
+
+def _enqueue(key: str, event: str) -> Job | None:
+    """Queue a job for `key` unless one is already queued/running."""
+    with _lock:
+        if key in _in_flight:
+            return None
+        _in_flight.add(key)
+    job = Job(issue_key=key, event=event)
+    store.add_job(job)
+    log.info("Queued %s (event=%s)", job.label, event)
+    _executor.submit(_run_job, job)
+    return job
 
 
 def _ignore(event: str, key: str | None, reason: str) -> dict:
@@ -107,14 +174,11 @@ async def jira_webhook(request: Request) -> dict:
     if not _is_trigger(payload, settings.trigger_label):
         return _ignore(event, key, f"ignored event {event!r} (only ticket created or label just added)")
 
-    with _lock:
-        if key in _in_flight:
-            return _ignore(event, key, "already queued")
-        _in_flight.add(key)
-
-    job = Job(issue_key=key, event=event)
-    store.add_job(job)
+    # Persist before acknowledging, so a restart right after this can still recover the ticket.
+    await asyncio.to_thread(_set_queue_label, key, True)
+    job = _enqueue(key, event)
+    if job is None:
+        return _ignore(event, key, "already queued")
     store.record_webhook(event=event, issue=key, outcome="accepted", reason=f"job {job.id}")
-    log.info("Webhook accepted: queued %s (event=%s)", job.label, event)
-    _executor.submit(_run_job, job)
+    log.info("Webhook accepted: %s", job.label)
     return {"accepted": True, "issue": key, "job_id": job.id}

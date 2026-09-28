@@ -92,9 +92,24 @@ class CodingAgent:
     def _redact(self, text: str) -> str:
         return text.replace(self.s.github_token, "***")
 
+    def _move(self, issue_key: str, status: str) -> None:
+        """Best-effort Jira status change; never fails the job."""
+        if not status:
+            return
+        try:
+            result = self.jira.transition_to(issue_key, status)
+        except Exception:
+            log.warning("Could not move %s to %r", issue_key, status, exc_info=True)
+            return
+        if result in ("moved", "already"):
+            self.job.jira_status = status
+        log.info("Jira status -> %r: %s", status, result)
+
     def handle_issue(self, issue_key: str) -> None:
         try:
             status, detail = self._handle(issue_key)
+            if status == "no_changes":
+                self._move(issue_key, self.s.jira_status_on_failure)
             self.job.finish(status, detail)
         except Exception as e:
             error = self._redact(str(e))
@@ -104,6 +119,7 @@ class CodingAgent:
                 self.jira.add_comment(issue_key, f"🤖 Coding agent failed:\n{{noformat}}{error[-1500:]}{{noformat}}")
             except Exception:
                 log.exception("Could not post failure comment to %s", issue_key)
+            self._move(issue_key, self.s.jira_status_on_failure)
 
     def _handle(self, issue_key: str) -> tuple[str, str | None]:
         job = self.job
@@ -129,6 +145,7 @@ class CodingAgent:
             return "skipped", "PR already open"
 
         self.jira.add_comment(issue_key, f"🤖 Coding agent picked this up. Working on branch {{{{{branch}}}}}...")
+        self._move(issue_key, self.s.jira_status_in_progress)
 
         base = self.gh.default_branch()
         repo_dir = Path(self.s.workdir) / issue_key
@@ -209,6 +226,7 @@ class CodingAgent:
                 f"🤖 Pull request opened: {pr_url}" + (f"\n\n*What changed:* {summary}" if summary else ""),
             )
             log.info("Opened %s", pr_url)
+            self._move(issue_key, self.s.jira_status_in_review)
             return "succeeded", None
         finally:
             shutil.rmtree(repo_dir, ignore_errors=True)

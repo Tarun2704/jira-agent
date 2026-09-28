@@ -28,6 +28,15 @@ class Settings(BaseSettings):
 
     # Behaviour
     trigger_label: str = "ai-agent"
+    # Added while a ticket is queued/running, removed when done. Tickets still carrying it
+    # after a restart are re-queued on startup. Empty = no persistence.
+    queue_label: str = "ai-agent-queued"
+    recovery_delay_seconds: int = 120
+
+    # Jira statuses the agent moves tickets to (empty = don't move). Must exist in the workflow.
+    jira_status_in_progress: str = "In Progress"
+    jira_status_in_review: str = "In Review"
+    jira_status_on_failure: str = "To Do"  # failed or no changes
     open_draft_pr: bool = True
     workdir: str = "/tmp/jira-agent"
 

@@ -38,6 +38,7 @@ Kept here so they aren't reintroduced.
 | Aider auto-ran model-suggested shell commands | `--yes-always` approves everything, including commands such as starting the dashboard server. | `--no-suggest-shell-commands`. |
 | Risk of an infinite comment loop | Jira sends `issue_updated` for comments, so the agent's own comments could re-trigger it. | Only ticket creation or newly added `ai-agent` label triggers a run. |
 | Renamed ticket could get a duplicate PR | The open-PR check matched the full branch name, which includes the ticket title. | Open PRs are matched by ticket key. |
+| Rerun failed if the old PR's branch still existed | A fresh branch from `main` can't be pushed over the leftover `ai/KEY-...` branch without force. | The agent force-pushes its own `ai/` branches (safe: only reached when no PR for the ticket is open). |
 | Weak PR descriptions | The PR body was just a diff stat and log tail. | An extra LLM call writes Summary / Changes / How to verify from the real diff (`app/pr_writer.py`). |
 
 ## Troubleshooting

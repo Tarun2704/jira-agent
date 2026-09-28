@@ -163,7 +163,8 @@ class CodingAgent:
             commit_msg = f"{issue.key}: {issue.summary}\n\n" + (f"{summary}\n\n" if summary else "") + f"Jira: {jira_url}"
             self._git("commit", "-m", commit_msg, cwd=repo_dir)
             diff_stat = self._git("diff", "--stat", f"{base}..HEAD", cwd=repo_dir)
-            self._git("push", "-u", "origin", branch, cwd=repo_dir)
+            # ai/* branches belong to the agent; overwrite a leftover branch from a closed PR.
+            self._git("push", "--force", "-u", "origin", branch, cwd=repo_dir)
 
             pr_url = self.gh.create_pr(
                 head=branch,

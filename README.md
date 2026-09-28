@@ -50,8 +50,11 @@ Jira ⚙ → System → WebHooks → Create a WebHook:
 
 - **URL**: `https://jira-agent.onrender.com/jira-webhook` (if there's no Secret field, append `?token=<WEBHOOK_SECRET>`)
 - **Secret**: your `WEBHOOK_SECRET`
-- **Events**: Issue → created (optionally updated)
-- **JQL**: `project = DEMO AND labels = ai-agent`
+- **Events**: Issue → created and updated
+- **JQL**: `project = CA AND labels = ai-agent`
+
+The agent runs on a new labelled ticket, or when the `ai-agent` label is added to an existing one.
+Other updates (edits, comments — including the agent's own) are ignored.
 
 ## Notes / limits
 

@@ -30,6 +30,26 @@ def _verify(request: Request, body: bytes, secret: str) -> bool:
     return bool(token) and hmac.compare_digest(token, secret)
 
 
+def _is_trigger(payload: dict, label: str) -> bool:
+    """New ticket, or an update that just added the trigger label.
+
+    Jira also sends jira:issue_updated for comments, so without this the agent's own
+    comments would re-trigger it.
+    """
+    event = payload.get("webhookEvent", "")
+    if event == "jira:issue_created":
+        return True
+    if event != "jira:issue_updated" or not label:
+        return False
+    for item in (payload.get("changelog") or {}).get("items") or []:
+        if item.get("field") == "labels":
+            before = (item.get("fromString") or "").split()
+            after = (item.get("toString") or "").split()
+            if label in after and label not in before:
+                return True
+    return False
+
+
 def _run_job(issue_key: str) -> None:
     try:
         CodingAgent(get_settings()).handle_issue(issue_key)
@@ -59,6 +79,8 @@ async def jira_webhook(request: Request) -> dict:
         return {"accepted": False, "reason": "no issue in payload"}
     if settings.trigger_label and settings.trigger_label not in labels:
         return {"accepted": False, "reason": f"missing label {settings.trigger_label!r}"}
+    if not _is_trigger(payload, settings.trigger_label):
+        return {"accepted": False, "reason": f"ignored event {event!r}"}
 
     with _lock:
         if key in _in_flight:

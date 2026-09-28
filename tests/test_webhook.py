@@ -75,6 +75,23 @@ def test_duplicate_while_in_flight_ignored(client):
     assert client.submitted == ["DEMO-1"]
 
 
+def test_update_adding_label_triggers(client):
+    p = _issue()
+    p["webhookEvent"] = "jira:issue_updated"
+    p["changelog"] = {"items": [{"field": "labels", "fromString": "bug", "toString": "bug ai-agent"}]}
+    assert _post(client, p).json()["accepted"]
+
+
+def test_comment_update_ignored(client):
+    # Jira sends issue_updated for comments (including the agent's own) - must not loop.
+    p = _issue()
+    p["webhookEvent"] = "jira:issue_updated"
+    p["comment"] = {"body": "🤖 Coding agent finished but made no changes."}
+    r = _post(client, p)
+    assert not r.json()["accepted"]
+    assert client.submitted == []
+
+
 def test_branch_name():
     from app.agent import branch_name
     from app.jira_client import JiraIssue

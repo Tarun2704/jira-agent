@@ -22,15 +22,15 @@ class GitHubClient:
         r.raise_for_status()
         return r.json()["default_branch"]
 
-    def find_open_pr(self, branch: str) -> str | None:
-        owner = self.repo.split("/")[0]
-        r = self._client.get(
-            f"/repos/{self.repo}/pulls",
-            params={"head": f"{owner}:{branch}", "state": "open"},
-        )
+    def find_open_pr_for_issue(self, issue_key: str) -> str | None:
+        """Open agent PR for this ticket, matched by key so a renamed ticket still matches."""
+        r = self._client.get(f"/repos/{self.repo}/pulls", params={"state": "open", "per_page": 100})
         r.raise_for_status()
-        prs = r.json()
-        return prs[0]["html_url"] if prs else None
+        for pr in r.json():
+            ref = pr["head"]["ref"]
+            if ref == f"ai/{issue_key}" or ref.startswith(f"ai/{issue_key}-"):
+                return pr["html_url"]
+        return None
 
     def create_pr(self, *, head: str, base: str, title: str, body: str, draft: bool) -> str:
         payload = {"head": head, "base": base, "title": title, "body": body, "draft": draft}

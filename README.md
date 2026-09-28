@@ -51,10 +51,12 @@ Example:
 | `app/pr_writer.py` | LLM-written PR description (Summary / Changes / How to verify) with a plain fallback |
 | `app/jira_client.py` | Get ticket, add comment |
 | `app/github_client.py` | Default branch, find open PR for a ticket, create PR |
+| `app/jobs.py` | Observability: job history for `/jobs`, step timings, token counts, job-tagged logs |
 | `app/config.py` | Settings from environment variables |
 | `scripts/check_setup.py` | Verify Jira, GitHub and Groq credentials and model (read-only, prints no secrets) |
 | `scripts/send_test_webhook.py` | Send a signed, Jira-shaped webhook for a ticket |
 | `docs/how-it-works.md` | The flow step by step: what each step does and why |
+| `docs/observability.md` | Logs and `/jobs`: where to look and what each line means |
 | `docs/known-issues.md` | Limitations, past fixes, troubleshooting |
 | `docs/setup-new-machine.md` | Step-by-step setup on another laptop |
 
@@ -117,6 +119,13 @@ Jira ⚙ → **System → WebHooks → Create a WebHook**:
 | Secret | your `WEBHOOK_SECRET` |
 | Events | Issue → **created** and **updated** |
 | JQL | `project = CA AND labels = ai-agent` |
+
+## Logs and job history
+
+- **Logs:** Render → service → **Logs**. Every webhook is logged with its outcome and reason; every job line is tagged like `[CA-3#1a2b3c4d]` and ends with a `Job finished` summary (status, step timings, tokens, PR).
+- **Job history:** `https://jira-agent-r9w8.onrender.com/jobs?token=<WEBHOOK_SECRET>` (add `&issue=CA-3` to filter). Resets on each deploy.
+
+Details: [docs/observability.md](docs/observability.md).
 
 ## Limits and troubleshooting
 

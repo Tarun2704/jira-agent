@@ -8,6 +8,7 @@ from pathlib import Path
 from app.config import Settings
 from app.github_client import GitHubClient
 from app.jira_client import JiraClient, JiraIssue
+from app.jobs import Job, parse_aider_tokens
 from app.pr_writer import build_pr_body, describe_changes, summary_line
 
 log = logging.getLogger(__name__)
@@ -72,10 +73,11 @@ def branch_name(issue: JiraIssue) -> str:
 
 
 class CodingAgent:
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, job: Job | None = None):
         self.s = settings
         self.jira = JiraClient(settings)
         self.gh = GitHubClient(settings)
+        self.job = job or Job(issue_key="?", event="manual")
 
     def _git(self, *args: str, cwd: Path, timeout: int = 300) -> str:
         return self._run(["git", *args], cwd=cwd, timeout=timeout)
@@ -92,32 +94,39 @@ class CodingAgent:
 
     def handle_issue(self, issue_key: str) -> None:
         try:
-            self._handle(issue_key)
+            status, detail = self._handle(issue_key)
+            self.job.finish(status, detail)
         except Exception as e:
-            log.exception("Job for %s failed", issue_key)
+            error = self._redact(str(e))
+            self.job.finish("failed", error[-1500:])
+            log.exception("Job failed at step %r", next(reversed(self.job.steps), "start"))
             try:
-                self.jira.add_comment(
-                    issue_key, f"🤖 Coding agent failed:\n{{noformat}}{self._redact(str(e))[-1500:]}{{noformat}}"
-                )
+                self.jira.add_comment(issue_key, f"🤖 Coding agent failed:\n{{noformat}}{error[-1500:]}{{noformat}}")
             except Exception:
                 log.exception("Could not post failure comment to %s", issue_key)
 
-    def _handle(self, issue_key: str) -> None:
-        issue = self.jira.get_issue(issue_key)
+    def _handle(self, issue_key: str) -> tuple[str, str | None]:
+        job = self.job
+        with job.step("fetch_ticket"):
+            issue = self.jira.get_issue(issue_key)
+        log.info("Ticket: %r (%s)", issue.summary, issue.issue_type)
         if self.s.trigger_label and self.s.trigger_label not in issue.labels:
-            log.info("%s lacks label %r, skipping", issue_key, self.s.trigger_label)
-            return
+            log.info("Skipped: ticket no longer has label %r", self.s.trigger_label)
+            return "skipped", f"label {self.s.trigger_label!r} removed"
 
         branch = branch_name(issue)
-        if existing := self.gh.find_open_pr_for_issue(issue_key):
-            log.info("PR already open for %s: %s", issue_key, existing)
+        with job.step("check_open_pr"):
+            existing = self.gh.find_open_pr_for_issue(issue_key)
+        if existing:
+            log.info("Skipped: PR already open for %s: %s", issue_key, existing)
+            job.pr_url = existing
             self.jira.add_comment(
                 issue_key,
                 f"🤖 Skipped: a pull request for this ticket is already open: {existing}\n"
                 f"To run the agent again, close or merge that PR, then remove and re-add the "
                 f"{{{{{self.s.trigger_label}}}}} label.",
             )
-            return
+            return "skipped", "PR already open"
 
         self.jira.add_comment(issue_key, f"🤖 Coding agent picked this up. Working on branch {{{{{branch}}}}}...")
 
@@ -128,62 +137,79 @@ class CodingAgent:
 
         clone_url = f"https://x-access-token:{self.s.github_token}@github.com/{self.s.github_repo}.git"
         try:
-            self._run(
-                ["git", "clone", "--depth", "50", "--branch", base, clone_url, str(repo_dir)],
-                cwd=repo_dir.parent,
-                timeout=300,
-            )
-            self._git("config", "user.name", "jira-coding-agent", cwd=repo_dir)
-            self._git("config", "user.email", "jira-coding-agent@users.noreply.github.com", cwd=repo_dir)
-            self._git("checkout", "-b", branch, cwd=repo_dir)
-            # Keep Aider's cache files out of the commit without touching .gitignore.
-            with open(repo_dir / ".git" / "info" / "exclude", "a") as f:
-                f.write("\n.aider*\n")
+            with job.step("clone"):
+                self._run(
+                    ["git", "clone", "--depth", "50", "--branch", base, clone_url, str(repo_dir)],
+                    cwd=repo_dir.parent,
+                    timeout=300,
+                )
+                self._git("config", "user.name", "jira-coding-agent", cwd=repo_dir)
+                self._git("config", "user.email", "jira-coding-agent@users.noreply.github.com", cwd=repo_dir)
+                self._git("checkout", "-b", branch, cwd=repo_dir)
+                # Keep Aider's cache files out of the commit without touching .gitignore.
+                with open(repo_dir / ".git" / "info" / "exclude", "a") as f:
+                    f.write("\n.aider*\n")
+            log.info("Cloned %s@%s into branch %s", self.s.github_repo, base, branch)
 
             crlf = crlf_files(repo_dir)
-            aider_log = self._run_aider(issue, repo_dir)
+            with job.step("aider"):
+                aider_log = self._run_aider(issue, repo_dir)
+            job.add_tokens(*parse_aider_tokens(aider_log))
             restore_crlf(repo_dir, crlf)
 
             self._git("add", "-A", cwd=repo_dir)
             if not self._git("status", "--porcelain", cwd=repo_dir).strip():
+                log.info("Aider made no changes. Output tail: %s", aider_log[-500:].replace("\n", " | "))
                 self.jira.add_comment(
                     issue_key,
                     "🤖 Coding agent finished but made no changes. "
                     "Try adding more detail (file names, expected behaviour) to the description.\n"
                     f"{{noformat}}{aider_log[-1500:]}{{noformat}}",
                 )
-                return
+                return "no_changes", "Aider made no changes"
+            log.info("Changed files: %s", self._git("diff", "--cached", "--stat", cwd=repo_dir).strip().replace("\n", " | "))
 
             jira_url = f"{self.s.jira_base_url.rstrip('/')}/browse/{issue.key}"
-            description = describe_changes(
-                self.s.aider_model, issue, self._git("diff", "--cached", cwd=repo_dir)
-            )
+            with job.step("describe"):
+                usage: dict[str, int] = {}
+                description = describe_changes(
+                    self.s.aider_model, issue, self._git("diff", "--cached", cwd=repo_dir), usage=usage
+                )
+            job.add_tokens(usage.get("sent", 0), usage.get("received", 0))
+            if description is None:
+                log.warning("PR description generation failed; using fallback description")
             summary = summary_line(description)
 
-            commit_msg = f"{issue.key}: {issue.summary}\n\n" + (f"{summary}\n\n" if summary else "") + f"Jira: {jira_url}"
-            self._git("commit", "-m", commit_msg, cwd=repo_dir)
-            diff_stat = self._git("diff", "--stat", f"{base}..HEAD", cwd=repo_dir)
-            # ai/* branches belong to the agent; overwrite a leftover branch from a closed PR.
-            self._git("push", "--force", "-u", "origin", branch, cwd=repo_dir)
+            with job.step("commit_push"):
+                commit_msg = (
+                    f"{issue.key}: {issue.summary}\n\n" + (f"{summary}\n\n" if summary else "") + f"Jira: {jira_url}"
+                )
+                self._git("commit", "-m", commit_msg, cwd=repo_dir)
+                diff_stat = self._git("diff", "--stat", f"{base}..HEAD", cwd=repo_dir)
+                # ai/* branches belong to the agent; overwrite a leftover branch from a closed PR.
+                self._git("push", "--force", "-u", "origin", branch, cwd=repo_dir)
 
-            pr_url = self.gh.create_pr(
-                head=branch,
-                base=base,
-                title=f"{issue.key}: {issue.summary}",
-                body=build_pr_body(
-                    issue=issue,
-                    jira_url=jira_url,
-                    description=description,
-                    diff_stat=diff_stat,
-                    agent_log=aider_log,
-                ),
-                draft=self.s.open_draft_pr,
-            )
+            with job.step("create_pr"):
+                pr_url = self.gh.create_pr(
+                    head=branch,
+                    base=base,
+                    title=f"{issue.key}: {issue.summary}",
+                    body=build_pr_body(
+                        issue=issue,
+                        jira_url=jira_url,
+                        description=description,
+                        diff_stat=diff_stat,
+                        agent_log=aider_log,
+                    ),
+                    draft=self.s.open_draft_pr,
+                )
+            job.pr_url = pr_url
             self.jira.add_comment(
                 issue_key,
                 f"🤖 Pull request opened: {pr_url}" + (f"\n\n*What changed:* {summary}" if summary else ""),
             )
-            log.info("Opened %s for %s", pr_url, issue_key)
+            log.info("Opened %s", pr_url)
+            return "succeeded", None
         finally:
             shutil.rmtree(repo_dir, ignore_errors=True)
 
@@ -192,7 +218,8 @@ class CodingAgent:
         history_dir.mkdir(parents=True, exist_ok=True)
         tracked = self._git("ls-files", "-z", cwd=repo_dir).split("\0")
         files = mentioned_files(issue, [p for p in tracked if p], repo_dir)
-        log.info("Files named in %s: %s", issue.key, files or "none (Aider will use its repo map)")
+        self.job.files = files
+        log.info("Files named in ticket: %s", files or "none (Aider will use its repo map)")
         cmd = [
             "aider",
             "--model", self.s.aider_model,
@@ -213,7 +240,7 @@ class CodingAgent:
             "--input-history-file", str(history_dir / "input.txt"),
             *files,
         ]
-        log.info("Running aider for %s with model %s", issue.key, self.s.aider_model)
+        log.info("Running aider with model %s", self.s.aider_model)
         try:
             return self._redact(self._run(cmd, cwd=repo_dir, timeout=self.s.aider_timeout_seconds))
         except subprocess.TimeoutExpired as e:

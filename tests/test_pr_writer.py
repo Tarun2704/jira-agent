@@ -18,11 +18,13 @@ def test_describe_changes_strips_fence_and_crlf(monkeypatch):
 
     def fake(model, prompt):
         seen["prompt"] = prompt
-        return f"```markdown\n{DESC}\n```"
+        return f"```markdown\n{DESC}\n```", {"sent": 100, "received": 20}
 
     monkeypatch.setattr(pr_writer, "_complete", fake)
-    out = pr_writer.describe_changes("m", ISSUE, "-a\r\n+b\r\n")
+    usage = {}
+    out = pr_writer.describe_changes("m", ISSUE, "-a\r\n+b\r\n", usage=usage)
     assert out == DESC
+    assert usage == {"sent": 100, "received": 20}
     assert "\r" not in seen["prompt"] and "CA-2" in seen["prompt"]
 
 
@@ -33,7 +35,7 @@ def test_describe_changes_returns_none_on_error_or_junk(monkeypatch):
     monkeypatch.setattr(pr_writer, "_complete", boom)
     assert pr_writer.describe_changes("m", ISSUE, "diff") is None
 
-    monkeypatch.setattr(pr_writer, "_complete", lambda m, p: "Sure! Here is a description.")
+    monkeypatch.setattr(pr_writer, "_complete", lambda m, p: ("Sure! Here is a description.", {}))
     assert pr_writer.describe_changes("m", ISSUE, "diff") is None
 
 

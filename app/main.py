@@ -9,8 +9,9 @@ from fastapi import FastAPI, HTTPException, Request
 
 from app.agent import CodingAgent
 from app.config import get_settings
+from app.jobs import Job, current_job, setup_logging, store
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+setup_logging()
 log = logging.getLogger("jira-agent")
 
 app = FastAPI(title="Jira Coding Agent")
@@ -50,12 +51,23 @@ def _is_trigger(payload: dict, label: str) -> bool:
     return False
 
 
-def _run_job(issue_key: str) -> None:
+def _run_job(job: Job) -> None:
+    ctx = current_job.set(job.label)
+    job.start()
+    log.info("Job started (event=%s)", job.event)
     try:
-        CodingAgent(get_settings()).handle_issue(issue_key)
+        CodingAgent(get_settings(), job).handle_issue(job.issue_key)
     finally:
+        log.info("Job finished: %s", job.summary())
+        current_job.reset(ctx)
         with _lock:
-            _in_flight.discard(issue_key)
+            _in_flight.discard(job.issue_key)
+
+
+def _ignore(event: str, key: str | None, reason: str) -> dict:
+    log.info("Webhook ignored: event=%s issue=%s reason=%s", event, key, reason)
+    store.record_webhook(event=event, issue=key, outcome="ignored", reason=reason)
+    return {"accepted": False, "reason": reason}
 
 
 @app.get("/health")
@@ -63,11 +75,24 @@ def health() -> dict:
     return {"status": "ok", "in_flight": sorted(_in_flight)}
 
 
+@app.get("/jobs")
+def jobs(request: Request, issue: str | None = None) -> dict:
+    """Recent jobs and webhook deliveries (newest first). Auth: ?token=<WEBHOOK_SECRET>
+    or 'Authorization: Bearer <WEBHOOK_SECRET>'. Resets on every restart/deploy."""
+    secret = get_settings().webhook_secret
+    token = request.query_params.get("token") or request.headers.get("authorization", "").removeprefix("Bearer ")
+    if not token or not hmac.compare_digest(token, secret):
+        raise HTTPException(status_code=401, detail="invalid token")
+    return {"in_flight": sorted(_in_flight), **store.snapshot(issue)}
+
+
 @app.post("/jira-webhook", status_code=202)
 async def jira_webhook(request: Request) -> dict:
     settings = get_settings()
     body = await request.body()
     if not _verify(request, body, settings.webhook_secret):
+        log.warning("Webhook rejected: invalid signature/token (check the Secret in Jira matches WEBHOOK_SECRET)")
+        store.record_webhook(event="?", issue=None, outcome="rejected", reason="invalid signature")
         raise HTTPException(status_code=401, detail="invalid signature")
 
     payload = await request.json()
@@ -76,17 +101,20 @@ async def jira_webhook(request: Request) -> dict:
     key = issue.get("key")
     labels = (issue.get("fields") or {}).get("labels") or []
     if not key:
-        return {"accepted": False, "reason": "no issue in payload"}
+        return _ignore(event, key, "no issue in payload")
     if settings.trigger_label and settings.trigger_label not in labels:
-        return {"accepted": False, "reason": f"missing label {settings.trigger_label!r}"}
+        return _ignore(event, key, f"missing label {settings.trigger_label!r}")
     if not _is_trigger(payload, settings.trigger_label):
-        return {"accepted": False, "reason": f"ignored event {event!r}"}
+        return _ignore(event, key, f"ignored event {event!r} (only ticket created or label just added)")
 
     with _lock:
         if key in _in_flight:
-            return {"accepted": False, "reason": "already queued"}
+            return _ignore(event, key, "already queued")
         _in_flight.add(key)
 
-    log.info("Queued %s (event=%s)", key, event)
-    _executor.submit(_run_job, key)
-    return {"accepted": True, "issue": key}
+    job = Job(issue_key=key, event=event)
+    store.add_job(job)
+    store.record_webhook(event=event, issue=key, outcome="accepted", reason=f"job {job.id}")
+    log.info("Webhook accepted: queued %s (event=%s)", job.label, event)
+    _executor.submit(_run_job, job)
+    return {"accepted": True, "issue": key, "job_id": job.id}

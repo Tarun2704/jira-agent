@@ -25,7 +25,7 @@ def client(monkeypatch):
 
     config.get_settings.cache_clear()
     submitted = []
-    monkeypatch.setattr(main._executor, "submit", lambda fn, key: submitted.append(key))
+    monkeypatch.setattr(main._executor, "submit", lambda fn, job: submitted.append(job.issue_key))
     main._in_flight.clear()
     c = TestClient(main.app)
     c.submitted = submitted

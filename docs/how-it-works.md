@@ -166,6 +166,9 @@ Whether the job succeeded or failed, the cloned repo and temp files are deleted 
 
 ## When something goes wrong
 
+Every step is logged with the job's tag (e.g. `[CA-3#1a2b3c4d]`) and timed; `/jobs` shows each job's status, step timings, tokens and errors. See [observability.md](observability.md).
+
+
 Any error in Steps 5–18 (bad token, network failure, Aider timeout, Git error) is caught by `handle_issue()`. It:
 1. logs the full error in Render's **Logs** tab,
 2. comments **🤖 Coding agent failed:** on the ticket with the last part of the error, with the GitHub token removed,

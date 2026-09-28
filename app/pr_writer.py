@@ -34,7 +34,7 @@ Describe only what the diff actually does. Do not invent changes, tests or files
 Output only the Markdown, no preamble and no code fence around it."""
 
 
-def _complete(model: str, prompt: str) -> str:
+def _complete(model: str, prompt: str) -> tuple[str, dict[str, int]]:
     # litellm is installed with Aider and understands the same model names (e.g. groq/...).
     from litellm import completion
 
@@ -44,11 +44,16 @@ def _complete(model: str, prompt: str) -> str:
         temperature=0.2,
         timeout=90,
     )
-    return resp.choices[0].message.content or ""
+    u = getattr(resp, "usage", None)
+    usage = {"sent": getattr(u, "prompt_tokens", 0) or 0, "received": getattr(u, "completion_tokens", 0) or 0}
+    return resp.choices[0].message.content or "", usage
 
 
-def describe_changes(model: str, issue: JiraIssue, diff: str) -> str | None:
-    """LLM-written description, or None if the call fails or returns junk."""
+def describe_changes(model: str, issue: JiraIssue, diff: str, usage: dict | None = None) -> str | None:
+    """LLM-written description, or None if the call fails or returns junk.
+
+    If `usage` is given, it's filled with the call's token counts ({"sent", "received"}).
+    """
     diff = diff.replace("\r", "")
     if len(diff) > MAX_DIFF_CHARS:
         diff = diff[:MAX_DIFF_CHARS] + "\n... (diff truncated)"
@@ -59,7 +64,10 @@ def describe_changes(model: str, issue: JiraIssue, diff: str) -> str | None:
         diff=diff,
     )
     try:
-        text = _complete(model, prompt).strip()
+        text, call_usage = _complete(model, prompt)
+        text = text.strip()
+        if usage is not None:
+            usage.update(call_usage)
     except Exception:
         log.exception("Could not generate PR description for %s", issue.key)
         return None

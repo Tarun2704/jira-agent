@@ -211,4 +211,4 @@ Saving environment variables in Render restarts the service automatically.
 | `send_test_webhook.py` returns 401 | `WEBHOOK_SECRET` in `.env` differs from the one the running agent uses. |
 | Docker: `Cannot connect to the Docker daemon` | Start Docker Desktop. |
 
-More in [known-issues.md](known-issues.md). How the flow works: [how-it-works.md](how-it-works.md).
+More in [known-issues.md](known-issues.md) and [observability.md](observability.md). How the flow works: [how-it-works.md](how-it-works.md).

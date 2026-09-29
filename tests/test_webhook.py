@@ -130,3 +130,15 @@ def test_mentioned_files(tmp_path):
 
     issue = JiraIssue("CA-1", "Fix path", "In `Crimes in India Dashboard.py` and big.csv ...", [], "Bug")
     assert mentioned_files(issue, tracked, tmp_path) == ["Crimes in India Dashboard.py"]
+
+
+def test_write_aiderignore_hides_large_files(tmp_path):
+    from app.agent import MAX_CONTEXT_FILE_BYTES, write_aiderignore
+
+    (tmp_path / "crime").mkdir()
+    (tmp_path / "crime" / "big data.csv").write_bytes(b"x" * (MAX_CONTEXT_FILE_BYTES + 1))
+    (tmp_path / "notes[1].ipynb").write_bytes(b"x" * (MAX_CONTEXT_FILE_BYTES + 1))
+    (tmp_path / "app.py").write_text("x = 1\n")
+    hidden = write_aiderignore(tmp_path, ["crime/big data.csv", "notes[1].ipynb", "app.py"])
+    assert hidden == ["crime/big data.csv", "notes[1].ipynb"]
+    assert (tmp_path / ".aiderignore").read_text().splitlines() == ["/crime/big data.csv", "/notes\\[1\\].ipynb"]

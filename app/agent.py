@@ -56,6 +56,19 @@ def mentioned_files(issue: JiraIssue, tracked: list[str], repo_dir: Path) -> lis
     return found
 
 
+def write_aiderignore(repo_dir: Path, tracked: list[str]) -> list[str]:
+    """Hide tracked files too big for the model's context (data files, notebooks) from Aider.
+
+    Aider adds any file the ticket mentions by name to the model's context; a single 1 MB CSV
+    is ~250k tokens, far beyond the model's limit. Returns the ignored paths.
+    """
+    big = [p for p in tracked if (repo_dir / p).is_file() and (repo_dir / p).stat().st_size > MAX_CONTEXT_FILE_BYTES]
+    # gitignore syntax: anchor to the repo root and escape glob characters.
+    lines = ["/" + re.sub(r"([\\*?\[\]!#])", r"\\\1", p) for p in big]
+    (repo_dir / ".aiderignore").write_text("\n".join(lines) + "\n")
+    return big
+
+
 def crlf_files(repo_dir: Path) -> set[str]:
     """Tracked files committed with Windows (CRLF) line endings."""
     out = subprocess.run(
@@ -283,8 +296,11 @@ class CodingAgent:
         history_dir = Path(self.s.workdir) / f"{issue.key}-aider"
         history_dir.mkdir(parents=True, exist_ok=True)
         if files is None:
-            tracked = self._git("ls-files", "-z", cwd=repo_dir).split("\0")
-            files = mentioned_files(issue, [p for p in tracked if p], repo_dir)
+            tracked = [p for p in self._git("ls-files", "-z", cwd=repo_dir).split("\0") if p]
+            hidden = write_aiderignore(repo_dir, tracked)
+            if hidden:
+                log.info("Hidden from Aider (too large for the model): %d file(s)", len(hidden))
+            files = mentioned_files(issue, tracked, repo_dir)
             self.job.files = files
             log.info("Files named in ticket: %s", files or "none (Aider will use its repo map)")
         cmd = [
@@ -305,8 +321,13 @@ class CodingAgent:
             "--analytics-disable",
             "--chat-history-file", str(history_dir / "chat.md"),
             "--input-history-file", str(history_dir / "input.txt"),
-            *files,
         ]
+        if files:
+            # The named files are all the model needs; the repo map would only add tokens.
+            cmd += ["--map-tokens", str(self.s.aider_map_tokens_when_files_named)]
+        if self.s.aider_reasoning_effort:
+            cmd += ["--reasoning-effort", self.s.aider_reasoning_effort, "--no-check-model-accepts-settings"]
+        cmd += files
         log.info("Running aider with model %s", self.s.aider_model)
         try:
             return self._redact(self._run(cmd, cwd=repo_dir, timeout=self.s.aider_timeout_seconds))

@@ -11,6 +11,7 @@ Things to know when running the Jira coding agent: current limitations, problems
 | **Status moves need matching statuses** | The agent moves tickets to "In Progress", "In Review" and back to "To Do". A status that doesn't exist in the project's workflow is skipped with a warning in the logs. | Add the missing column on the board, or change `JIRA_STATUS_*` on Render. Set one to empty to disable that move. |
 | **One job at a time** | Several tickets created together are handled one after another. | Expected on the 512 MB free instance; don't raise the worker count there. |
 | **Vague tickets fail** | "Improve the code" gives poor or no edits. | Name the file(s) and describe the expected behaviour. Tickets that name a file get that file handed to Aider directly. |
+| **Groq free tier: ~8,000 tokens per request** | Groq's free tier allows about 8,000 tokens per minute for `gpt-oss-120b`, counting the prompt **and** the reply. Tickets that need a large rewrite (e.g. replacing a 100-line function) get cut off; the agent reports "made no changes" with `hit a token limit` in the output. | Keep tickets small and additive (new functions or files, a few lines changed). For bigger tasks, switch `AIDER_MODEL` to a provider with higher free limits (e.g. Google Gemini's free tier) or a paid tier. |
 | **Free LLM limits** | Groq's free tier is rate-limited. Free tiers may log or train on prompts. | Only point the agent at code you're fine sending to the provider. Switch provider with `AIDER_MODEL` + its API key. |
 | **Groq retires models** | Jobs fail with a model-not-found error. | Run `.venv/bin/python scripts/check_setup.py`; it lists the models available to your key. Update `AIDER_MODEL` on Render. |
 | **GitHub token expires** | Clone/push/PR fails after the expiry date chosen at creation. | Create a new fine-grained token (Contents + Pull requests: Read and write, target repo only) and update `GITHUB_TOKEN` on Render. |
@@ -46,6 +47,7 @@ Kept here so they aren't reintroduced.
 | No way to tell why a ticket was ignored | Ignored webhooks weren't logged, and there was no job history. | Every webhook is logged with its outcome and reason; `/jobs` shows recent jobs and deliveries ([observability.md](observability.md)). |
 | Restart lost queued/running tickets | The queue was only in memory. | The queue is also kept in Jira as the `ai-agent-queued` label; labelled tickets are re-queued after startup. |
 | PRs could contain code that doesn't even compile | Nothing checked the model's edits. | Changed Python files are compiled before the PR; a syntax error gets one automatic fix attempt, and the result is shown in the PR's **Checks** section. |
+| Tickets naming a data file failed with a huge token count | Aider adds any file mentioned in the ticket to the model's context; one 1 MB CSV is ~250k tokens. | Files over 200 KB are hidden from Aider via a generated `.aiderignore`; the repo map is skipped when the ticket names its files. |
 | Weak PR descriptions | The PR body was just a diff stat and log tail. | An extra LLM call writes Summary / Changes / How to verify from the real diff (`app/pr_writer.py`). |
 
 ## Troubleshooting

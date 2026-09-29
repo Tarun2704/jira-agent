@@ -21,6 +21,11 @@ class Settings(BaseSettings):
     # "diff" = search/replace blocks, so the model only touches the lines it changes
     # (Aider falls back to "whole"-file rewrites for models it doesn't know).
     aider_edit_format: str = "diff"
+    # Groq's free tier caps each request (prompt + reply, incl. reasoning) at ~8k tokens per
+    # minute, so keep requests small: skip the repo map when the ticket names its files, and
+    # keep reasoning short. Empty reasoning effort = don't send the setting.
+    aider_map_tokens_when_files_named: int = 0
+    aider_reasoning_effort: str = ""
     aider_timeout_seconds: int = 900
 
     # Webhook auth: Jira's HMAC secret, also accepted as ?token=<secret>

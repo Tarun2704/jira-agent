@@ -28,6 +28,7 @@ POST /jira-webhook ──queue──▶ CodingAgent
 - **Add the label `ai-agent`.** Without it the agent ignores the ticket.
 - **Name the file(s)** to change, e.g. `` In `Crimes in India Dashboard.py`, ... ``. Named files are given to the agent directly.
 - **Say what should happen**, not just what's wrong. Add "Don't change anything else" to keep the PR small.
+- **Keep it small and additive** (a new function or file, a few changed lines). The free Groq tier allows ~8,000 tokens per request, so big rewrites get cut off.
 - Keep one change per ticket.
 
 Example:

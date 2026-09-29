@@ -106,6 +106,8 @@ Every job starts from a clean clone, so one ticket's leftovers can't leak into t
 ### Step 10: Pick the files to give Aider
 `mentioned_files()` looks for repo files whose path or file name appears in the ticket's summary or description (e.g. `Crimes in India Dashboard.py`), skipping files over 200 KB such as large CSVs.
 
+Files over 200 KB (data files such as CSVs, large notebooks) are listed in a generated `.aiderignore` so Aider never loads them: a single 1 MB CSV would be ~250k tokens. When the ticket names its files, Aider's repo map is also skipped (`--map-tokens 0`) to keep the request within Groq's free-tier limit (~8,000 tokens per request).
+
 *Why:* Aider only edits files that have been "added to the chat". Left alone, it didn't reliably add files whose names contain spaces, so the model asked for the file and then gave up. If the ticket names no file, Aider falls back to its **repo map** (a summary of the codebase) to find the right place.
 
 ### Step 11: Run Aider

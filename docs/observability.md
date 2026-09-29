@@ -33,7 +33,8 @@ It needs the `WEBHOOK_SECRET` (the token is hidden as `token=***` in the logs). 
   | `issue_key`, `id` | Ticket and a short job ID (logs show it as `CA-3#1a2b3c4d`) |
   | `status` | `queued` → `running` → `succeeded` / `no_changes` / `skipped` / `failed` |
   | `queued_at`, `started_at`, `finished_at`, `duration_s` | Timing (UTC) |
-  | `steps` | Seconds per step: `fetch_ticket`, `check_open_pr`, `clone`, `aider`, `describe`, `commit_push`, `create_pr` |
+  | `steps` | Seconds per step: `fetch_ticket`, `check_open_pr`, `clone`, `aider`, `checks`, `aider_fix` (only if a syntax error had to be fixed), `describe`, `commit_push`, `create_pr` |
+  | `checks` | Result of each check, e.g. `{"Python syntax": "passed"}` |
   | `files` | Files named in the ticket and handed to Aider |
   | `tokens` | LLM tokens used (Aider + PR description) |
   | `event` | `jira:issue_created`, `jira:issue_updated`, or `recovered_after_restart` |
@@ -75,6 +76,8 @@ What problems look like:
 | `Startup recovery: N ticket(s) re-queued from Jira label 'ai-agent-queued': [...]` | Logged ~2 min after every start; lists tickets resumed after a restart (usually 0). |
 | `WARNING ... Jira status 'In Review' not available for CA-3 (available: [...])` | That status isn't in the workflow; add it on the board or change `JIRA_STATUS_IN_REVIEW`. |
 | `WARNING ... Could not add label 'ai-agent-queued'` | Jira call failed; the job still runs but won't survive a restart. |
+| `Check Python syntax: passed - ...` | The changed files compile. |
+| `WARNING ... Syntax errors, asking Aider to fix them: ...` | The first attempt broke the syntax; one fix attempt follows. Look for `after fix attempt: passed/failed`. |
 | `Skipped: PR already open` | Close/merge that PR, then re-add the label. |
 | `Aider made no changes. Output tail: ...` | Ticket too vague; the tail shows what the model said. |
 | `WARNING ... PR description generation failed` | LLM call failed (often rate limits); PR still opened with a basic description. |

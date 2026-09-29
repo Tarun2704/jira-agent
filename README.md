@@ -1,5 +1,7 @@
 # Jira Coding Agent
 
+[![Tests](https://github.com/Tarun2704/jira-agent/actions/workflows/tests.yml/badge.svg)](https://github.com/Tarun2704/jira-agent/actions/workflows/tests.yml)
+
 Create a Jira ticket with the label `ai-agent` and this service fixes it: it clones the repo, has an LLM (via [Aider](https://aider.chat)) make the change, pushes a branch, opens a pull request with a written description, and comments the PR link back on the ticket. Everything runs on free tiers (Jira Free, GitHub Free, Render Free, Groq).
 
 For a step-by-step explanation of what happens during a run, see [docs/how-it-works.md](docs/how-it-works.md).
@@ -14,6 +16,7 @@ POST /jira-webhook ──queue──▶ CodingAgent
                               ├─ git clone, branch ai/KEY-title
                               ├─ aider: edit files named in the ticket (diff mode, no shell commands)
                               ├─ restore original line endings
+                              ├─ syntax-check changed files (one automatic fix attempt on errors)
                               ├─ LLM writes PR description from the real diff
                               ├─ commit + push
                               ├─ open draft PR (GitHub REST)
@@ -50,6 +53,7 @@ While it works, the agent moves the ticket **To Do → In Progress → In Review
 |---|---|
 | `app/main.py` | FastAPI app: webhook signature check, trigger rules, dedupe, single-worker queue |
 | `app/agent.py` | The job: clone → Aider → commit → push → PR → Jira comments |
+| `app/checks.py` | Checks run before the PR (Python syntax), shown as a **Checks** section in the PR |
 | `app/pr_writer.py` | LLM-written PR description (Summary / Changes / How to verify) with a plain fallback |
 | `app/jira_client.py` | Get ticket, add comment |
 | `app/github_client.py` | Default branch, find open PR for a ticket, create PR |
@@ -102,7 +106,7 @@ docker run --env-file .env -p 8000:8000 jira-agent
 
 Jira can't reach your laptop, so locally you trigger tickets with `send_test_webhook.py`.
 
-Tests (no credentials needed): `.venv/bin/python -m pytest -q`
+Tests (no credentials needed): `.venv/bin/python -m pytest -q`. They also run on GitHub Actions on every push (`.github/workflows/tests.yml`); see the badge at the top.
 
 ## Deploy to Render (free)
 

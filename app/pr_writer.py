@@ -84,7 +84,7 @@ def summary_line(description: str | None) -> str:
 
 
 def build_pr_body(
-    *, issue: JiraIssue, jira_url: str, description: str | None, diff_stat: str, agent_log: str
+    *, issue: JiraIssue, jira_url: str, description: str | None, diff_stat: str, agent_log: str, checks_md: str = ""
 ) -> str:
     ticket = f"[{issue.key}]({jira_url}): {issue.summary}"
     main = description or (
@@ -93,7 +93,8 @@ def build_pr_body(
     )
     return (
         f"{main}\n\n"
-        f"---\n"
+        + (f"{checks_md}\n\n" if checks_md else "")
+        + f"---\n"
         f"**Jira:** {ticket}\n\n"
         f"**Files changed**\n```\n{diff_stat.strip()}\n```\n\n"
         f"<details><summary>Agent log (tail)</summary>\n\n```\n{agent_log[-3000:]}\n```\n</details>\n\n"

@@ -5,6 +5,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
+from app.checks import CheckResult, format_checks_md, python_syntax_check
 from app.config import Settings
 from app.github_client import GitHubClient
 from app.jira_client import JiraClient, JiraIssue
@@ -26,6 +27,14 @@ def build_task_prompt(issue: JiraIssue) -> str:
         "Make the smallest correct change to the codebase that resolves this ticket. "
         "Follow the existing code style. Update or add tests if the repo has them. "
         "Do not change unrelated code."
+    )
+
+
+def build_fix_prompt(issue: JiraIssue, errors: list[str]) -> str:
+    return (
+        f"Your change for Jira ticket {issue.key} ({issue.summary}) left Python syntax errors:\n\n"
+        + "\n".join(errors)
+        + "\n\nFix these syntax errors. Keep the intended change for the ticket and don't change anything else."
     )
 
 
@@ -186,6 +195,12 @@ class CodingAgent:
                 return "no_changes", "Aider made no changes"
             log.info("Changed files: %s", self._git("diff", "--cached", "--stat", cwd=repo_dir).strip().replace("\n", " | "))
 
+            check, aider_log = self._check_and_fix(issue, repo_dir, crlf, aider_log)
+            job.checks[check.name] = check.status
+            if check.retried and not self._git("status", "--porcelain", cwd=repo_dir).strip():
+                self.jira.add_comment(issue_key, "🤖 Coding agent's fix attempt removed all its changes; nothing to submit.")
+                return "no_changes", "fix attempt removed all changes"
+
             jira_url = f"{self.s.jira_base_url.rstrip('/')}/browse/{issue.key}"
             with job.step("describe"):
                 usage: dict[str, int] = {}
@@ -217,32 +232,66 @@ class CodingAgent:
                         description=description,
                         diff_stat=diff_stat,
                         agent_log=aider_log,
+                        checks_md=format_checks_md([check]),
                     ),
                     draft=self.s.open_draft_pr,
                 )
             job.pr_url = pr_url
+            checks_note = (
+                "\n\n⚠️ *Checks failed:* syntax errors remain; see the PR before merging."
+                if check.status == "failed" else ""
+            )
             self.jira.add_comment(
                 issue_key,
-                f"🤖 Pull request opened: {pr_url}" + (f"\n\n*What changed:* {summary}" if summary else ""),
+                f"🤖 Pull request opened: {pr_url}" + (f"\n\n*What changed:* {summary}" if summary else "") + checks_note,
             )
             log.info("Opened %s", pr_url)
             self._move(issue_key, self.s.jira_status_in_review)
-            return "succeeded", None
+            return "succeeded", ("checks failed: " + "; ".join(check.errors)) if check.status == "failed" else None
         finally:
             shutil.rmtree(repo_dir, ignore_errors=True)
 
-    def _run_aider(self, issue: JiraIssue, repo_dir: Path) -> str:
+    def _check_and_fix(self, issue: JiraIssue, repo_dir: Path, crlf: set[str], aider_log: str) -> tuple[CheckResult, str]:
+        """Syntax-check the changed files; on errors, give Aider one attempt to fix them."""
+        def changed() -> list[str]:
+            out = self._git("diff", "--cached", "--name-only", "--diff-filter=ACMR", "-z", cwd=repo_dir)
+            return [f for f in out.split("\0") if f]
+
+        with self.job.step("checks"):
+            result = python_syntax_check(repo_dir, changed())
+        log.info("Check %s: %s - %s", result.name, result.status, result.summary)
+        if result.status != "failed":
+            return result, aider_log
+
+        log.warning("Syntax errors, asking Aider to fix them: %s", " | ".join(result.errors))
+        with self.job.step("aider_fix"):
+            fix_log = self._run_aider(
+                issue, repo_dir, message=build_fix_prompt(issue, result.errors), files=result.failed_files
+            )
+        self.job.add_tokens(*parse_aider_tokens(fix_log))
+        restore_crlf(repo_dir, crlf)
+        self._git("add", "-A", cwd=repo_dir)
+
+        result = python_syntax_check(repo_dir, changed())
+        result.retried = True
+        log.info("Check %s after fix attempt: %s - %s", result.name, result.status, result.summary)
+        return result, f"{aider_log}\n\n----- fix attempt after syntax check -----\n{fix_log}"
+
+    def _run_aider(
+        self, issue: JiraIssue, repo_dir: Path, message: str | None = None, files: list[str] | None = None
+    ) -> str:
         history_dir = Path(self.s.workdir) / f"{issue.key}-aider"
         history_dir.mkdir(parents=True, exist_ok=True)
-        tracked = self._git("ls-files", "-z", cwd=repo_dir).split("\0")
-        files = mentioned_files(issue, [p for p in tracked if p], repo_dir)
-        self.job.files = files
-        log.info("Files named in ticket: %s", files or "none (Aider will use its repo map)")
+        if files is None:
+            tracked = self._git("ls-files", "-z", cwd=repo_dir).split("\0")
+            files = mentioned_files(issue, [p for p in tracked if p], repo_dir)
+            self.job.files = files
+            log.info("Files named in ticket: %s", files or "none (Aider will use its repo map)")
         cmd = [
             "aider",
             "--model", self.s.aider_model,
             "--edit-format", self.s.aider_edit_format,
-            "--message", build_task_prompt(issue),
+            "--message", message or build_task_prompt(issue),
             "--yes-always",
             # --yes-always would otherwise auto-run any shell command the model suggests.
             "--no-suggest-shell-commands",

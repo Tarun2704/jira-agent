@@ -132,6 +132,13 @@ The run has a **15-minute timeout** (`AIDER_TIMEOUT_SECONDS`). Aider's output is
 ### Step 13: Check that something actually changed
 `git add -A`, then `git status`. If nothing changed, the agent comments **"🤖 Coding agent finished but made no changes"** with the last part of Aider's output (usually the model explaining what it needed), and stops. This mostly happens with vague tickets.
 
+**Then check that the change compiles** (`_check_and_fix()`, `app/checks.py`). Every changed Python file is compiled in memory (no `.pyc` files end up in the commit). If there's a syntax error, Aider gets **one** more attempt with the exact error message (e.g. `line 258: '(' was never closed`), and the files are checked again. The result becomes a **Checks** section in the PR:
+- ✅ passed, noting if the agent had to fix its own first attempt
+- ❌ failed, with the errors and a "Do not merge" warning; the Jira comment also says *Checks failed*
+- ➖ skipped, when no Python files changed
+
+The PR is still opened when checks fail, so the attempt is visible and reviewable, but it's clearly flagged.
+
 ### Step 14: Write the PR description
 `describe_changes()` in `app/pr_writer.py` sends the ticket and the **actual staged diff** (capped at 12,000 characters) to the same LLM, asking for three Markdown sections:
 - **Summary**: the problem and how the PR fixes it

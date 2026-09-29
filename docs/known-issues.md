@@ -17,7 +17,7 @@ Things to know when running the Jira coding agent: current limitations, problems
 | **Draft PRs need a public repo** on GitHub Free | For private repos, draft creation is rejected. | Handled automatically: the agent retries as a normal PR. |
 | **Agent PRs can conflict** | Two tickets touching nearby lines of the same file produce PRs that conflict with each other. | Merge one, then resolve the other on GitHub, keeping both changes. |
 | **Single target repo** | Every ticket goes to `GITHUB_REPO`. | Multi-repo support (e.g. map by Jira component) is not built yet. |
-| **No tests are run** | The agent doesn't run the repo's tests before opening the PR. | Review every PR. Running tests before the PR is a possible next step. |
+| **Checks are syntax-only** | The agent verifies that changed Python files compile (and fixes syntax errors once), but doesn't run the repo's tests, so logic bugs aren't caught. | Review every PR. Running the repo's tests (e.g. Aider's `--test-cmd`) is a possible next step once the target repo has tests. |
 | **`/jobs` history resets** on every deploy/restart | Older runs aren't in `/jobs`. | Use Render's Logs (limited retention on the free plan). |
 | **No alerts** | Nobody is notified when a job fails. | Check Jira comments / `/jobs`. Sentry or UptimeRobot (free) could add alerts. |
 | **Webhooks can be lost during a deploy** | A ticket created while Render is redeploying may never reach the agent (seen with CA-3). | Replay with `send_test_webhook.py`, or re-add the label. Render **Build Filters** can skip deploys for docs-only changes. |
@@ -45,6 +45,7 @@ Kept here so they aren't reintroduced.
 | Rerun failed if the old PR's branch still existed | A fresh branch from `main` can't be pushed over the leftover `ai/KEY-...` branch without force. | The agent force-pushes its own `ai/` branches (safe: only reached when no PR for the ticket is open). |
 | No way to tell why a ticket was ignored | Ignored webhooks weren't logged, and there was no job history. | Every webhook is logged with its outcome and reason; `/jobs` shows recent jobs and deliveries ([observability.md](observability.md)). |
 | Restart lost queued/running tickets | The queue was only in memory. | The queue is also kept in Jira as the `ai-agent-queued` label; labelled tickets are re-queued after startup. |
+| PRs could contain code that doesn't even compile | Nothing checked the model's edits. | Changed Python files are compiled before the PR; a syntax error gets one automatic fix attempt, and the result is shown in the PR's **Checks** section. |
 | Weak PR descriptions | The PR body was just a diff stat and log tail. | An extra LLM call writes Summary / Changes / How to verify from the real diff (`app/pr_writer.py`). |
 
 ## Troubleshooting

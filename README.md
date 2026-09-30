@@ -4,6 +4,8 @@
 
 Create a Jira ticket with the label `ai-agent` and this service fixes it: it clones the repo, has an LLM (via [Aider](https://aider.chat)) make the change, pushes a branch, opens a pull request with a written description, and comments the PR link back on the ticket. Everything runs on free tiers (Jira Free, GitHub Free, Render Free, Groq).
 
+**Understand the design:** [docs/design-and-scenarios.md](docs/design-and-scenarios.md) explains the full flow, what happens in every scenario, the alternatives considered, and why Aider was used instead of building a custom AI coding agent.
+
 For a step-by-step explanation of what happens during a run, see [docs/how-it-works.md](docs/how-it-works.md).
 Setting up on another computer: [docs/setup-new-machine.md](docs/setup-new-machine.md).
 
@@ -66,6 +68,7 @@ While it works, the agent moves the ticket **To Do → In Progress → In Review
 | `docs/observability.md` | Logs and `/jobs`: where to look and what each line means |
 | `docs/known-issues.md` | Limitations, past fixes, troubleshooting |
 | `docs/setup-new-machine.md` | Step-by-step setup on another laptop |
+| `docs/design-and-scenarios.md` | Full flow, behaviour in every scenario, options considered, and why Aider |
 
 ## Configuration
 

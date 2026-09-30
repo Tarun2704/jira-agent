@@ -210,6 +210,8 @@ At first glance, "send the code to the LLM and write back what it says" sounds l
 
 ## 6. What would change at a bigger scale
 
+The full, prioritised list is in [roadmap.md](roadmap.md). The main points:
+
 - **More than one worker**, and a real queue (Redis or a database) instead of the Jira label.
 - **A paid or higher-limit LLM**, so bigger tickets fit.
 - **Run the project's tests** before opening the PR (Aider's `--test-cmd`), not just a syntax check.

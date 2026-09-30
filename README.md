@@ -48,7 +48,7 @@ Example:
 
 While it works, the agent moves the ticket **To Do → In Progress → In Review** (or back to **To Do** if it failed or changed nothing), and marks queued tickets with the label `ai-agent-queued` so they're resumed after a restart. Details in [docs/how-it-works.md](docs/how-it-works.md).
 
-**To rerun a ticket:** close or merge its PR, then remove and re-add the `ai-agent` label.
+**To rerun a ticket:** close or merge its PR, then remove and re-add the `ai-agent` label. Step-by-step instructions, including cleanup, are in [docs/operations.md](docs/operations.md).
 
 ## Layout
 
@@ -69,6 +69,8 @@ While it works, the agent moves the ticket **To Do → In Progress → In Review
 | `docs/known-issues.md` | Limitations, past fixes, troubleshooting |
 | `docs/setup-new-machine.md` | Step-by-step setup on another laptop |
 | `docs/design-and-scenarios.md` | Full flow, behaviour in every scenario, options considered, and why Aider |
+| `docs/operations.md` | Runbook: run a ticket, run it again, fix a stuck ticket, clean up after tests or a demo |
+| `docs/roadmap.md` | What it would take to make this a production tool, in priority order |
 
 ## Configuration
 

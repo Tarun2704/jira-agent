@@ -39,6 +39,7 @@ def build_fix_prompt(issue: JiraIssue, errors: list[str]) -> str:
 
 
 MAX_CONTEXT_FILE_BYTES = 200_000
+AIDER_MODEL_SETTINGS_FILE = Path(__file__).resolve().parent.parent / "aider-model-settings.yml"
 
 
 def mentioned_files(issue: JiraIssue, tracked: list[str], repo_dir: Path) -> list[str]:
@@ -321,6 +322,7 @@ class CodingAgent:
             "--analytics-disable",
             "--chat-history-file", str(history_dir / "chat.md"),
             "--input-history-file", str(history_dir / "input.txt"),
+            "--model-settings-file", str(AIDER_MODEL_SETTINGS_FILE),
         ]
         if files:
             # The named files are all the model needs; the repo map would only add tokens.

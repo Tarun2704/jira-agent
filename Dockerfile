@@ -9,6 +9,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
+COPY aider-model-settings.yml .
 
 ENV PYTHONUNBUFFERED=1 \
     AIDER_CHECK_UPDATE=false \

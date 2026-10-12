@@ -142,3 +142,13 @@ def test_the_coder_is_told_which_files_are_already_deleted():
     p = build_task_prompt(issue, "plan", "", ["x.deb"])
     assert "ALREADY DELETED" in p and "`x.deb`" in p and "rest of the plan" in p
     assert "ALREADY DELETED" not in build_task_prompt(issue, "plan", "")
+
+
+def test_a_daily_quota_is_named_and_does_not_trigger_the_wait():
+    from app.agent import is_rate_limit, llm_problem, retryable_llm_problem
+    out = ('litellm.RateLimitError: geminiException - {\n"quotaId": "GenerateRequestsPerDayPerProjectPerModel-FreeTier",\n'
+           '"quotaDimensions": {"location": "global", "model": "gemini-2.5-flash"}, "quotaValue": "20"\n'
+           '"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "71102s"}\nThe API provider has rate limited you.\n')
+    p = llm_problem(out)
+    assert "daily free quota for gemini-2.5-flash" in p and "about 20 hour" in p and "PLANNER_FALLBACK_MODEL" in p
+    assert retryable_llm_problem(p) and not is_rate_limit(p)  # a fallback model is tried; waiting 45s is pointless

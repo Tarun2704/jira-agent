@@ -53,6 +53,13 @@ def llm_problem(output: str) -> str | None:
     if not lines:
         return None
     blob = "\n".join(lines)
+    if re.search(r"PerDay", output):  # a daily quota: waiting a minute can't help, so say so (and let a fallback model take over)
+        model = (re.search(r'"model":\s*"([^"]+)"', output) or [None, "the model"])[1]
+        delay = re.search(r'"retryDelay":\s*"(\d+)s"', output)
+        resets = f" It resets in about {max(1, round(int(delay.group(1)) / 3600))} hour(s)." if delay else ""
+        return (f"The daily free quota for {model} is used up (daily quota: free keys allow only a few requests per day per model).{resets} "
+                "Set a fallback model (PLANNER_FALLBACK_MODEL / AIDER_FALLBACK_MODEL), switch models, or use a key with billing.\n"
+                f"Provider said: {lines[0][:200]}")
     for pattern, reason in _LLM_PROBLEMS:
         if re.search(pattern, blob, re.I):
             return f"{reason}\nProvider said: {lines[0][:300]}"
@@ -61,7 +68,7 @@ def llm_problem(output: str) -> str | None:
 
 def retryable_llm_problem(problem: str | None) -> bool:
     """Rate limits and provider outages can pass or be avoided with another model; a bad key or a blocked prompt can't."""
-    return bool(problem) and ("rate or usage limit" in problem or "unavailable or timed out" in problem)
+    return bool(problem) and ("rate or usage limit" in problem or "daily quota" in problem or "unavailable or timed out" in problem)
 
 
 _NOISE = ("Aider v", "Main model:", "Model:", "Git repo:", "Repo-map:", "Added ", "Tokens:", "Cost:", "Warning:",

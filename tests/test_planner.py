@@ -310,7 +310,8 @@ def test_failed_file_discovery_becomes_a_warning(tmp_path, monkeypatch):
     monkeypatch.setattr(planner, "_complete", lambda m, p: (_ for _ in ()).throw(RuntimeError("litellm.RateLimitError: TPM limit")))
     warnings = []
     assert planner.discover_files("m", ISSUE, "", tracked, tmp_path, None, warnings) == []
-    assert len(warnings) == 1 and "rate or usage limit" in warnings[0] and "planned without" in warnings[0]
+    assert len(warnings) == 1 and "busy or at its usage limit" in warnings[0] and "planned without" in warnings[0]
+    assert "litellm" not in warnings[0] and "TPM" not in warnings[0]
 
 
 def test_run_aider_records_prompt_and_output_even_on_failure(monkeypatch, tmp_path):

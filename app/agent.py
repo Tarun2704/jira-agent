@@ -6,6 +6,7 @@ import subprocess
 import time
 from pathlib import Path
 
+from app.friendly import explain
 from app.checks import CheckResult, format_checks_md, python_syntax_check
 from app.config import Settings
 from app.github_client import GitHubClient
@@ -274,12 +275,12 @@ class CodingAgent:
             result = self.jira.transition_to(issue_key, status)
         except Exception as e:
             log.warning("Could not move %s to %r", issue_key, status, exc_info=True)
-            self.job.warnings.append(f"Couldn't move the Jira ticket to {status!r} ({type(e).__name__}).")
+            self.job.warnings.append(f"I couldn't move the Jira ticket to {status!r}.")
             return
         if result in ("moved", "already"):
             self.job.jira_status = status
         else:
-            self.job.warnings.append(f"Couldn't move the Jira ticket to {status!r} (no such transition from its current status).")
+            self.job.warnings.append(f"I couldn't move the Jira ticket to {status!r} (its workflow doesn't allow that from the current status).")
         log.info("Jira status -> %r: %s", status, result)
 
     def handle_issue(self, issue_key: str) -> None:
@@ -293,7 +294,7 @@ class CodingAgent:
             self.job.finish("failed", error[-1500:])
             log.exception("Job failed at step %r", next(reversed(self.job.steps), "start"))
             try:
-                self.jira.add_comment(issue_key, f"🤖 Coding agent failed:\n{{noformat}}{error[-1500:]}{{noformat}}")
+                self.jira.add_comment(issue_key, f"🤖 I couldn't finish this ticket. {explain(error)} (Reference: {self.job.id})")
             except Exception:
                 log.exception("Could not post failure comment to %s", issue_key)
             self._move(issue_key, self.s.jira_status_on_failure)
@@ -360,14 +361,14 @@ class CodingAgent:
             job.add_tokens(*parse_aider_tokens(aider_log))
             restore_crlf(repo_dir, crlf)
             if self.deleted and llm_problem(aider_log):
-                job.warnings.append("The model call failed, so only the file deletions were made; the rest of the plan was not done. " + llm_problem(aider_log).splitlines()[0])
+                job.warnings.append("The AI service had a problem, so only the file deletions were made; the rest of the plan was not done. " + explain(llm_problem(aider_log)))
 
             self._git("add", "-A", cwd=repo_dir)
             if not self._git("status", "--porcelain", cwd=repo_dir).strip():
                 first_problem = llm_problem(aider_log)
                 if is_rate_limit(first_problem) and not self.s.aider_fallback_model and self.s.rate_limit_wait_seconds:
                     log.warning("Rate limited; waiting %ss and trying the same model once more", self.s.rate_limit_wait_seconds)
-                    job.warnings.append(f"The model was rate limited, so I waited {self.s.rate_limit_wait_seconds}s and tried again.")
+                    job.warnings.append("The AI service was busy, so I waited a moment and tried again.")
                     time.sleep(self.s.rate_limit_wait_seconds)
                     with job.step("aider_retry"):
                         aider_log = self._run_aider(issue, repo_dir)
@@ -377,7 +378,7 @@ class CodingAgent:
                     first_problem = llm_problem(aider_log)
                 if retryable_llm_problem(first_problem) and self.s.aider_fallback_model:
                     log.warning("Main model failed (%s); retrying once with %s", first_problem.splitlines()[0], self.s.aider_fallback_model)
-                    job.warnings.append(f"The main model failed ({first_problem.splitlines()[0]}); the fallback model {self.s.aider_fallback_model} did the work.")
+                    job.warnings.append("The main AI service wasn't available, so a backup service did the work.")
                     with job.step("aider_fallback"):
                         aider_log = self._run_aider(issue, repo_dir, model=self.s.aider_fallback_model)
                     job.add_tokens(*parse_aider_tokens(aider_log))
@@ -391,8 +392,8 @@ class CodingAgent:
                 said = aider_reply(aider_log) or "(the model gave no explanation)"
                 self.jira.add_comment(
                     issue_key,
-                    "🤖 Coding agent finished but made no changes. Here is what the model said:\n"
-                    f"{{noformat}}{said}{{noformat}}",
+                    "🤖 I looked at the code and didn't change anything. Here is what I found:\n"
+                    f"{said}",
                 )
                 return "no_changes", said
             log.info("Changed files: %s", self._git("diff", "--cached", "--stat", cwd=repo_dir).strip().replace("\n", " | "))
@@ -447,7 +448,7 @@ class CodingAgent:
                         )
                     except Exception as e:
                         log.warning("Could not comment on PR #%s", pr_number, exc_info=True)
-                        job.warnings.append(f"Pushed to PR #{pr_number}, but couldn't comment on it ({type(e).__name__}).")
+                        job.warnings.append(f"Pushed to PR #{pr_number}, but couldn't leave a comment on it.")
                 else:
                     body = build_pr_body(
                         issue=issue,

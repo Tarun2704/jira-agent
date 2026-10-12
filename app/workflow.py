@@ -24,6 +24,7 @@ from contextlib import contextmanager
 from app import slack_client as sc
 from app.agent import CodingAgent
 from app.config import Settings
+from app.friendly import explain, reference
 from app.github_client import GitHubClient
 from app.jira_client import JiraClient, mention
 from app.jobs import Job
@@ -138,7 +139,7 @@ class Workflow:
             if tries == 0:  # tell you once, not on every retry
                 s = self.store.get(key) if self.store else None
                 if s and s.slack_channel:
-                    self._post_reliably(s.slack_channel, f":warning: *{key}*: couldn't comment on the Jira ticket ({type(e).__name__}). I'll retry shortly.")
+                    self._post_reliably(s.slack_channel, f":warning: *{key}*: couldn't comment on the Jira ticket. I'll retry shortly.")
 
     @contextmanager
     def leased(self, key: str):
@@ -246,7 +247,7 @@ class Workflow:
                 job.finish("succeeded" if outcome == "posted" else "skipped", outcome)
             except Exception as e:
                 log.exception("Planning failed for %s", key)
-                self._plan_failed(s, self._scrub(str(e)))
+                self._plan_failed(s, self._scrub(str(e)), job.id)
                 job.finish("failed", self._scrub(str(e))[-500:])
             finally:
                 self._save_runs(job, "plan")
@@ -273,7 +274,7 @@ class Workflow:
             return pr["branch"] if pr["state"] == "open" else None
         except Exception as e:
             log.warning("Could not check PR #%s for %s", s.pr_number, s.issue_key, exc_info=True)
-            self._say(s, f":warning: I couldn't check the state of PR #{s.pr_number} ({type(e).__name__}), so I looked at the main branch instead. The plan may miss the earlier changes.")
+            self._say(s, f":warning: I couldn't check the state of PR #{s.pr_number}, so I looked at the main branch instead. The plan may miss the earlier changes.")
             return None
 
     def _plan(self, job: Job, s: Session) -> str:
@@ -427,12 +428,12 @@ class Workflow:
         except Exception:
             log.warning("Could not mark old plan message superseded for %s", s.issue_key, exc_info=True)
 
-    def _plan_failed(self, s: Session, error: str) -> None:
+    def _plan_failed(self, s: Session, error: str, job_id: str = "") -> None:
         key = s.issue_key
         fresh = self.store.get(key) or s
         again = "Ask again to retry." if fresh.followup else "Reply here to try again."
         # an error answers what you just wrote: in the thread if you wrote in a thread, in the main chat if you wrote there
-        ref = self._say(fresh, f":x: I couldn't produce the plan for {key}:\n```{error[-1200:]}```\n{again}", important=True, thread_ts=fresh.reply_to)
+        ref = self._say(fresh, f":x: I couldn't produce the plan for {key}. {explain(error)}\n{again}{reference(job_id)}", important=True, thread_ts=fresh.reply_to)
         thread = fresh.slack_thread_ts or (ref or {}).get("ts", "")
         channel = fresh.slack_channel or (ref or {}).get("channel", "")
         if ref and not fresh.slack_thread_ts:
@@ -457,7 +458,7 @@ class Workflow:
             x.touch()
 
         self.store.update(key, fail)
-        self._jira_comment(key, f"🤖 Planner failed:\n{{noformat}}{error[-1200:]}{{noformat}}")
+        self._jira_comment(key, f"🤖 I couldn't produce the plan. {explain(error)}{reference(job_id).replace('_', '')}")
 
     def resume_if_needed(self, key: str) -> None:
         """After a plan job: if you wrote again while it ran, plan again."""
@@ -681,7 +682,7 @@ class Workflow:
             st = self._strategy(s)
         except Exception as e:
             log.warning("Could not check the PR for %s", s.issue_key, exc_info=True)
-            return f":information_source: I couldn't check PR #{s.pr_number} just now ({type(e).__name__}); I'll check again when I start."
+            return f":information_source: I couldn't check PR #{s.pr_number} just now; I'll check again when I start."
         if st["mode"] == "continue":
             return f":information_source: This adds a commit to the open PR #{st['pr_number']} (same branch)."
         why = {"merged": "was merged", "closed": "was closed without merging"}.get(st.get("state", ""), "doesn't exist")
@@ -795,7 +796,7 @@ class Workflow:
                     }
             except Exception as e:
                 log.warning("Could not decide how to deliver %s", key, exc_info=True)
-                job.finish("failed", f"Couldn't check the pull request's state ({type(e).__name__}: {self._scrub(str(e))[:200]}). Nothing was changed.")
+                job.finish("failed", "Couldn't check the pull request's state. Nothing was changed.")
                 self._finish_execution(s, job)
                 return
             # handle_issue never raises: it records the outcome on the job and comments on the ticket.
@@ -861,13 +862,13 @@ class Workflow:
                 msg += f"\n:warning: {job.detail}"
             msg += f"\n{ask}"
         elif job.status == "skipped":
-            msg = f":information_source: *{key}* was skipped: {job.detail}\n{ask}"
+            msg = f":information_source: *{key}* was skipped. {explain(job.detail or '')}\n{ask}"
         elif job.status == "no_changes":
-            msg = (f":thinking_face: *{key}*: the agent finished but changed nothing. This is what the model said:\n"
-                   f"```{(job.detail or '(no explanation)')[-1000:]}```\n"
-                   "Reply here with what to do differently (file names help) and I'll plan again.")
+            said = "\n".join("> " + ln for ln in (job.detail or "(no explanation given)")[-700:].splitlines() if ln.strip())
+            msg = (f":thinking_face: *{key}*: I looked at the code and didn't change anything. Here is what I found:\n{said}\n"
+                   "Reply here with what to do differently (naming the files helps) and I'll plan again.")
         else:
-            msg = f":x: *{key}* failed:\n```{(job.detail or 'unknown error')[-1200:]}```\nReply to try again."
+            msg = f":x: *{key}*: I couldn't finish this. {explain(job.detail or '')}\nReply here to try again.{reference(job.id)}"
         for w in job.warnings:
             msg += f"\n:warning: {w}"
         fresh = self.store.get(key) or s

@@ -342,7 +342,7 @@ async def jira_webhook(request: Request) -> dict:
             try:
                 await asyncio.to_thread(
                     JiraClient(settings).add_comment, key,
-                    f"🤖 I couldn't start planning right now ({type(e).__name__}: my storage may be down). I'll retry automatically; nothing was lost.",
+                    "🤖 I couldn't start planning right now (I couldn't save my progress). I'll retry automatically; nothing was lost.",
                 )
             except Exception:
                 log.warning("Could not comment about the deferred start on %s", key, exc_info=True)
@@ -429,7 +429,7 @@ def _handle_slack_message(event: dict) -> None:
         log.info("Slack message handled: %s", outcome)
     except Exception as e:
         log.exception("Slack message handling failed")
-        _tell_user(event.get("channel", ""), f":x: Something went wrong handling your message ({type(e).__name__}). Please send it again in a minute.", event.get("thread_ts") or "")
+        _tell_user(event.get("channel", ""), ":x: Something went wrong handling your message. Please send it again in a minute.", event.get("thread_ts") or "")
 
 
 def _handle_slack_action(action_id: str, key: str, user: str, channel: str, message_ts: str) -> None:
@@ -438,7 +438,7 @@ def _handle_slack_action(action_id: str, key: str, user: str, channel: str, mess
         log.info("Slack action %s on %s handled: %s", action_id, key, outcome)
     except Exception as e:
         log.exception("Slack action handling failed")
-        _tell_user(channel, f":x: That button didn't work ({type(e).__name__}). Please press it again in a minute.")
+        _tell_user(channel, ":x: That button didn't work. Please press it again in a minute.")
 
 
 @app.post("/slack/events")

@@ -162,3 +162,9 @@ Aider can only edit files; it cannot delete them. So deletions are a separate, c
 4. The result message lists what was deleted, and the round remembers it for later follow-ups. If the model call fails after deleting, you are told only the deletions were made.
 
 Plans without a `## Delete` section (including older ones) delete nothing.
+
+## What people see when something fails
+
+Slack and Jira only get plain-language messages: what happened and what to do next (for example "The AI service is busy or at its usage limit right now. Please try again in a few minutes."). No model names, provider text, exception names or git output. Each failure ends with a short **Reference** code (the job id).
+
+The technical details stay on the server: the Render logs (every line is tagged `[CA-7#<reference>]`) and `/runs/<ticket>?token=<WEBHOOK_SECRET>` for the full prompts and replies. The wording lives in `app/friendly.py`; unknown errors get a generic "something went wrong on my side" message.

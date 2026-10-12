@@ -292,7 +292,7 @@ def test_planner_failure_reports_and_waits_for_a_reply(env):
     said = env.slack.posts[-1]["text"]
     assert "couldn't produce the plan" in said and "gh-secret-token" not in said
     assert env.store.key_for_thread("D1", s.slack_thread_ts) == "CA-1"
-    assert any("Planner failed" in c[1] and "gh-secret-token" not in c[1] for c in env.jira.comments)
+    assert any("couldn't produce the plan" in c[1] and "gh-secret-token" not in c[1] and "boom" not in c[1] for c in env.jira.comments)
     # Proceed is refused while there is no plan; a reply re-plans
     assert env.wf.on_action(ACTION_PROCEED, "CA-1", ME, "D1", s.slack_thread_ts) == "no_plan"
     env.plans[:] = [PlanResult("", "## Plan\n1. ok")]
@@ -415,7 +415,8 @@ def test_llm_failure_during_chat_is_reported_and_the_ack_is_closed(env):
     env.wf.on_user_message("D1", "", ME, "add tests too", "9.9")
     ack = env.slack.posts[-1]
     job = plan_job(env)
-    assert job.status == "failed" and "rate or usage limit" in env.slack.posts[-1]["text"]
+    assert job.status == "failed" and "usage limit" in env.slack.posts[-1]["text"] and "RuntimeError" not in env.slack.posts[-1]["text"]
+    assert "Reference:" in env.slack.posts[-1]["text"]
     assert any(u["ts"] == ack["ts"] and "Couldn't process" in u["text"] for u in env.slack.updates)
     assert env.store.get("CA-1").status == AWAITING_REPLY and env.store.get("CA-1").plan  # old plan kept
 
@@ -703,7 +704,7 @@ def test_github_down_at_execute_time_is_reported_and_nothing_runs(env, monkeypat
     assert job.status == "failed" and len(RecordingAgent.calls) == calls_before  # the agent never ran
     s = env.store.get("CA-1")
     assert s.status == DELIVERED and s.rounds[-1]["outcome"] == "failed"
-    assert "Couldn't check the pull request's state" in env.slack.posts[-1]["text"]
+    assert "couldn't check the pull request" in env.slack.posts[-1]["text"].lower() and "Reference:" in env.slack.posts[-1]["text"]
 
 
 def test_jira_retrigger_of_a_delivered_ticket_forces_a_plan_and_needs_the_label(env, monkeypatch):

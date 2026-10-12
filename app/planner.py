@@ -11,6 +11,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from app.friendly import explain
 from app.agent import (
     MAX_CONTEXT_FILE_BYTES, MAX_CONTEXT_FILES, AgentError, CodingAgent, empty_reply, llm_problem, merge_files,
     aider_reply, is_rate_limit, mentioned_files, retryable_llm_problem,
@@ -223,8 +224,8 @@ def discover_files(
     except Exception as e:
         log.warning("File discovery failed for %s; planning without it", issue.key, exc_info=True)
         if warnings is not None:
-            reason = llm_problem(f"{type(e).__name__}: {e}") or f"{type(e).__name__}: {str(e)[:200]}"
-            warnings.append(f"Couldn't search the repo for relevant files ({reason.splitlines()[0]}). I planned without that step, so the file list may be incomplete.")
+            reason = explain(llm_problem(f"{type(e).__name__}: {e}") or "")
+            warnings.append(f"I couldn't scan the project for related files, so I planned without that step and the file list may be incomplete. {reason}")
         return []
     return parse_paths(reply, set(paths))
 
@@ -524,14 +525,14 @@ class Planner:
                 problem = llm_problem(output)
                 if parse(output) is None and is_rate_limit(problem) and not self.s.planner_fallback_model and self.s.rate_limit_wait_seconds:
                     log.warning("Planner rate limited; waiting %ss and retrying once", self.s.rate_limit_wait_seconds)
-                    self.warnings.append(f"The model was rate limited, so I waited {self.s.rate_limit_wait_seconds}s and tried again.")
+                    self.warnings.append("The AI service was busy, so I waited a moment and tried again.")
                     time.sleep(self.s.rate_limit_wait_seconds)
                     output = ask(self.s.effective_planner_model)
                     problem = llm_problem(output)
                 if parse(output) is None and retryable_llm_problem(problem) and self.s.planner_fallback_model:
                     log.warning("Planner model failed (%s); retrying with %s", problem.splitlines()[0], self.s.planner_fallback_model)
                     self.warnings.append(
-                        f"The planner model failed ({problem.splitlines()[0]}); the fallback model {self.s.planner_fallback_model} wrote this."
+                        "The main AI service wasn't available, so a backup service wrote this plan."
                     )
                     output = ask(self.s.planner_fallback_model)
                     used_fallback = True

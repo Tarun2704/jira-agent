@@ -346,3 +346,16 @@ def test_planner_checks_deletions_against_the_repo(monkeypatch, tmp_path):
     assert "## Delete\n- `a.py`" in r.body and "ghost.bin" not in r.body
     assert any("ghost.bin" in w for w in r.warnings)
     assert "a.py" not in r.files  # a file that is deleted is not one to edit
+
+
+def test_a_failing_fallback_model_is_named_in_the_error(monkeypatch, tmp_path):
+    import pytest
+
+    from app import planner
+    from app.agent import AgentError
+
+    monkeypatch.setattr(planner.time, "sleep", lambda s: None)
+    p = _planner_with_output(monkeypatch, tmp_path, "litellm.RateLimitError: PerDay quota ... model gemini-2.5-flash\n")
+    p.s.planner_fallback_model = "gemini/old-model"
+    with pytest.raises(AgentError, match="fallback model gemini/old-model was tried"):
+        p.run(ISSUE, Session("CA-1"))

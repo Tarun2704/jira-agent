@@ -494,6 +494,7 @@ class Planner:
         repo_dir.parent.mkdir(parents=True, exist_ok=True)
         clone_url = f"https://x-access-token:{self.s.github_token}@github.com/{self.s.github_repo}.git"
         tracked: list[str] = []
+        used_fallback = False
         try:
             with self.job.step("clone"):
                 a._run(["git", "clone", "--depth", "50", "--branch", branch or base, clone_url, str(repo_dir)],
@@ -533,6 +534,7 @@ class Planner:
                         f"The planner model failed ({problem.splitlines()[0]}); the fallback model {self.s.planner_fallback_model} wrote this."
                     )
                     output = ask(self.s.planner_fallback_model)
+                    used_fallback = True
         finally:
             shutil.rmtree(repo_dir, ignore_errors=True)
 
@@ -542,6 +544,8 @@ class Planner:
             problem = llm_problem(output) or (
                 "The model returned an empty reply (possibly blocked by its content filter)." if empty_reply(output) else None
             )
+            if problem and used_fallback:
+                problem = f"The fallback model {self.s.planner_fallback_model} was tried after the main model failed, and it failed too: {problem}"
             if problem:
                 extra = f"\nAider's output ended with:\n{aider_reply(output, 700)}" if "couldn't apply the model's edit" in problem else ""
                 raise AgentError(f"The LLM call failed. {problem}{extra}")

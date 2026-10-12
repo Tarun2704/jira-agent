@@ -955,3 +955,18 @@ def test_an_answer_only_reply_keeps_the_planned_deletions(env):
     env.wf.on_user_message("D1", "", ME, "what gets deleted?", "10.1")
     plan_job(env)
     assert env.store.get("CA-1").delete_files == ["old.bin"]
+
+
+def test_re_adding_the_label_retries_a_first_plan_that_failed(env):
+    env.plans[:] = [RuntimeError("quota")]
+    env.wf.on_trigger("CA-1")
+    plan_job(env)
+    s = env.store.get("CA-1")
+    assert s.status == AWAITING_REPLY and not s.plan and s.result
+    env.submitted.clear()
+    env.plans[:] = [PlanResult("", "## Plan\n1. x", files=["a.py"])]
+    assert env.wf.on_trigger("CA-1") is True and env.submitted == [("plan", "CA-1")]
+    assert env.store.get("CA-1").status == PLANNING
+    plan_job(env)
+    assert env.store.get("CA-1").plan.startswith("## Plan")
+    assert env.wf.on_trigger("CA-1") is False  # now a plan exists and is waiting: ignored as before

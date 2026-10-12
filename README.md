@@ -112,6 +112,8 @@ docker run --env-file .env -p 8000:8000 jira-agent
 
 Jira can't reach your laptop, so locally you trigger tickets with `send_test_webhook.py`.
 
+With Slack and Redis configured, every ticket gets a plan first and waits for your approval in Slack: see [docs/plan-first.md](docs/plan-first.md) (includes running it locally with a tunnel).
+
 Tests (no credentials needed): `.venv/bin/python -m pytest -q`. They also run on GitHub Actions on every push (`.github/workflows/tests.yml`); see the badge at the top.
 
 ## Deploy to Render (free)

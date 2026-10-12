@@ -64,6 +64,10 @@ def parse_aider_tokens(output: str) -> tuple[int, int]:
     return sent, received
 
 
+MAX_RUN_PROMPT = 8000  # characters kept per run; Redis and Slack both have limits
+MAX_RUN_OUTPUT = 30000
+
+
 @dataclass
 class Job:
     issue_key: str
@@ -82,6 +86,10 @@ class Job:
     jira_status: str | None = None  # last status the agent moved the ticket to
     checks: dict[str, str] = field(default_factory=dict)  # check name -> passed/failed/skipped
     detail: str | None = None  # skip reason or error message
+    kind: str = "code"  # "code" = the original direct flow; "plan" / "execute" = plan-first workflow
+    runs: list[dict] = field(default_factory=list)  # each Aider run: prompt in, output out (see record_run)
+    warnings: list[str] = field(default_factory=list)  # non-fatal problems the person should hear about
+    delivery: dict = field(default_factory=dict)  # branch, PR number/url, diff and summary of what was delivered
     _t0: float = 0.0
 
     @property
@@ -102,6 +110,14 @@ class Job:
             yield
         finally:
             self.steps[name] = round(time.monotonic() - t, 1)
+
+    def record_run(self, step: str, model: str, prompt: str, output: str, ok: bool = True) -> None:
+        """Keep what was sent to the model and what came back, for later inspection (/runs/<key>)."""
+        self.runs.append({
+            "at": _now(), "step": step, "model": model, "ok": ok,
+            "prompt": prompt[:MAX_RUN_PROMPT], "output": output[-MAX_RUN_OUTPUT:],
+            "output_truncated": len(output) > MAX_RUN_OUTPUT,
+        })
 
     def add_tokens(self, sent: int, received: int) -> None:
         self.tokens["sent"] += sent
@@ -124,6 +140,8 @@ class Job:
     def to_dict(self) -> dict:
         d = asdict(self)
         d.pop("_t0")
+        d["runs"] = len(d["runs"])  # /jobs shows only the count; the text is at /runs/<key>
+        d.pop("delivery", None)
         return d
 
 

@@ -176,6 +176,13 @@ class Workflow:
         s = self.store.get(key)
         if s and s.status == DELIVERED:  # re-triggered after delivery: a follow-up round, always with a plan
             return self._start_followup(key, "jira", "Ticket updated in Jira and re-triggered (see its current description).", True)
+        if s and s.status == AWAITING_REPLY and not s.plan and s.result:
+            # the first plan failed (an error was sent to you): re-adding the label tries again
+            retried = self.store.transition(key, {AWAITING_REPLY}, PLANNING, result="")
+            if retried is None:
+                return False
+            self.submit(PLAN_JOB, key)
+            return True
         if self.store.create(key) is None:  # (a completed ticket starts a new session that keeps its earlier rounds)
             return False
         self.submit(PLAN_JOB, key)

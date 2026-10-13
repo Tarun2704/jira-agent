@@ -7,6 +7,7 @@ import logging
 import threading
 import time
 import urllib.parse
+from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 
@@ -18,6 +19,7 @@ from app.costs import summarize
 from app.config import get_settings
 from app.jira_client import JiraClient
 from app.jobs import Job, current_job, setup_logging, store
+from app.selfping import SelfPinger
 from app.slack_client import SlackClient, verify_signature
 from app.store import SessionStore
 from app.workflow import EXECUTE_JOB, PLAN_JOB, Workflow
@@ -116,10 +118,19 @@ def _startup_checks() -> None:
         log.warning("CONFIG: cannot reach Redis (%s: %s). Check REDIS_URL.", type(e).__name__, e)
 
 
+# When /tick last ran (startup, an outside pinger or our own self-ping), shown by /health.
+_last_tick: dict = {"at": 0.0, "source": ""}
+
+
+def _note_tick(source: str) -> None:
+    _last_tick["at"], _last_tick["source"] = time.time(), source
+
+
 def _startup_tick() -> None:
     _startup_checks()
     try:
         log.info("Startup tick: %s", _workflow().tick())
+        _note_tick("startup")
     except Exception:
         log.warning("Startup tick failed", exc_info=True)
 
@@ -133,7 +144,19 @@ async def lifespan(app: FastAPI):
     else:
         threading.Thread(target=_startup_checks, name="startup-checks", daemon=True).start()
         threading.Thread(target=_recover_after_delay, name="recover-queued", daemon=True).start()
+    pinger = None
+    base = get_settings().self_ping_base
+    if base:
+        s = get_settings()
+        pinger = SelfPinger(base, s.tick_token, s.self_ping_interval_seconds, alert_after=s.self_ping_alert_after,
+                            notify=lambda text: _workflow().slack.post(text))
+        pinger.start()
+        log.info("Self-ping is ON: this app calls its own /tick every %ss (keeps a free Render service awake).", pinger.interval)
+    elif get_settings().planning_enabled:
+        log.info("Self-ping is OFF (no public URL: RENDER_EXTERNAL_URL / SELF_PING_URL, or disabled). Use an outside pinger for /tick.")
     yield
+    if pinger:
+        pinger.stop()
 
 
 app = FastAPI(title="Jira Coding Agent", lifespan=lifespan)
@@ -269,12 +292,24 @@ def _ignore(event: str, key: str | None, reason: str) -> dict:
 @app.get("/health")
 def health() -> dict:
     settings = get_settings()
-    return {
+    out = {
         "status": "ok",
         "in_flight": sorted(_in_flight),
         "plan_mode": settings.planning_enabled,
         "problems": settings.config_problems(),  # names only, never secret values
     }
+    if settings.planning_enabled:
+        at = _last_tick["at"]
+        age = round(time.time() - at) if at else None
+        out["tick"] = {
+            "last_at": datetime.fromtimestamp(at, timezone.utc).isoformat(timespec="seconds") if at else None,
+            "age_seconds": age,
+            "source": _last_tick["source"] or None,
+            "self_ping": bool(settings.self_ping_base),
+            # no tick for more than two intervals: the pinger/self-ping is not reaching us
+            "overdue": age is None or age > 2 * settings.self_ping_interval_seconds,
+        }
+    return out
 
 
 @app.get("/jobs")
@@ -401,7 +436,9 @@ def tick(request: Request) -> dict:
         wf = _workflow()
         while _deferred_triggers:
             wf.defer_trigger(_deferred_triggers.pop())
-        return {"planning_enabled": True, **wf.tick()}
+        result = wf.tick()
+        _note_tick("request")
+        return {"planning_enabled": True, **result}
     except Exception as e:  # e.g. Redis unreachable: a clear failure for the pinger to show
         log.exception("Tick failed")
         raise HTTPException(status_code=503, detail=f"tick failed: {type(e).__name__}") from e

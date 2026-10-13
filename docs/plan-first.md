@@ -177,3 +177,20 @@ Every model call (file search, planning, coding, syntax fix, PR description, and
 - **Prices:** set `MODEL_PRICES` to JSON of USD per 1M tokens, `{"model name": [input, output]}`, using the exact model names. Prices are not built in because they change. A model that isn't listed shows its cost as unknown (null), and so does any round that used one; tokens and request counts are always kept. List free-tier models as `[0, 0]`.
 - **Slack:** the delivery message ends with `Cost this round: about $0.12 (ticket total $0.30)`, or `AI use this round: 5 requests, 42k tokens` when a price is missing. `SHOW_COST_IN_SLACK=false` hides it.
 - **Estimates:** Aider's token counts come from the `Tokens:` lines it prints, so costs are estimates. A call that times out before printing is not counted, and Aider's own internal retries are not visible.
+
+## Self-ping (keeps /tick running)
+
+`/tick` does the background work: recovering crashed jobs, the 48-hour reminder, merge and PR-comment checks. Something has to call it. Besides an outside pinger, the app now calls its **own public** `/tick` every `SELF_PING_INTERVAL_SECONDS` (default 600).
+
+- **Why the public URL:** Render's free tier sleeps a service after about 15 minutes without *incoming* requests. A call to our own `https://...onrender.com/tick` comes in through Render's front door, so it counts as traffic and resets that timer, and it runs the tick.
+- **When it runs:** only if plan-first mode is on, `TICK_TOKEN` is set, and a public URL is known (`RENDER_EXTERNAL_URL`, which Render sets itself, or `SELF_PING_URL`). On your own machine none of these is set, so it stays off. `SELF_PING_ENABLED=false` turns it off.
+- **Limit:** it can't wake a service that is already asleep (the timer sleeps too). After a deploy or restart it starts again by itself. An outside pinger on `/tick` covers that gap; a paid always-on instance removes it.
+- **Logs:** each ping logs `Self-ping: /tick answered 200`. A 401 means `TICK_TOKEN` is wrong; "could not reach our own /tick" means the call failed and will be retried. The token is never logged. The startup log says whether self-ping is ON or OFF.
+- **Check it:** `GET /health` now shows `tick`: when the last tick ran, how long ago, who triggered it (`startup` or `request`), whether self-ping is on, and `overdue: true` if there was no tick for more than two intervals.
+
+### Overlapping ticks, the token, and alerts
+
+- **One tick at a time.** A tick takes a Redis lock (`jiraagent:ticklock`, at most `TICK_LOCK_SECONDS`, default 300) and an in-process lock. A second call (self-ping plus an outside pinger, a slow tick, two instances during a deploy, your local container on the same Redis) gets `{"skipped": "a tick is already running"}` and does nothing, so a reminder or PR-comment prompt can't go out twice. A tick that crashes releases the lock, and if it can't, the lock expires by itself. If Redis is down the tick fails (503) as before.
+- **The token is sent as `Authorization: Bearer ...`**, not in the URL, so it can't appear in request logs. An outside pinger can keep using `?token=` or send the header.
+- **Slack alert.** After `SELF_PING_ALERT_AFTER` (3) failed self-pings in a row you get one message saying why in plain words (wrong token, wrong address, can't reach itself, or the tick failed), and one more when it recovers. A ping that is only slow (the tick still running) is not a failure. This cannot fire while the whole service is asleep, since nothing is running to send it; an outside pinger or a paid always-on instance covers that.
+

@@ -33,6 +33,7 @@ WAITING = {AWAITING_REPLY, CONFIRMING}
 
 KEEP_FINISHED_SECONDS = 30 * 24 * 3600
 MAX_RUNS_PER_TICKET = 40  # newest kept; each run is at most ~40 KB
+MAX_COST_ENTRIES = 200  # per ticket; each entry is a few hundred bytes
 
 
 @dataclass
@@ -227,6 +228,18 @@ class SessionStore:
 
     def get_runs(self, key: str) -> list[dict]:
         return [json.loads(x) for x in self.r.lrange(f"{PREFIX}runs:{key}", 0, -1)]
+
+    # ---- cost: one entry per finished job (tokens, requests, cost). No expiry: totals outlive the session ------
+
+    def append_cost(self, key: str, entry: dict) -> None:
+        k = f"{PREFIX}cost:{key}"
+        pipe = self.r.pipeline()
+        pipe.rpush(k, json.dumps(entry))
+        pipe.ltrim(k, -MAX_COST_ENTRIES, -1)
+        pipe.execute()
+
+    def get_costs(self, key: str) -> list[dict]:
+        return [json.loads(x) for x in self.r.lrange(f"{PREFIX}cost:{key}", 0, -1)]
 
     # ---- Jira comments that couldn't be posted (Jira down): retried on the next tick --------------
 

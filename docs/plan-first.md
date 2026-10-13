@@ -168,3 +168,12 @@ Plans without a `## Delete` section (including older ones) delete nothing.
 Slack and Jira only get plain-language messages: what happened and what to do next (for example "The AI service is busy or at its usage limit right now. Please try again in a few minutes."). No model names, provider text, exception names or git output. Each failure ends with a short **Reference** code (the job id).
 
 The technical details stay on the server: the Render logs (every line is tagged `[CA-7#<reference>]`) and `/runs/<ticket>?token=<WEBHOOK_SECRET>` for the full prompts and replies. The wording lives in `app/friendly.py`; unknown errors get a generic "something went wrong on my side" message.
+
+## Cost per ticket
+
+Every model call (file search, planning, coding, syntax fix, PR description, and any retry or fallback call) is recorded with its model and token counts. When a planning or coding job ends, one record per job is saved in Redis under the ticket and its round (`jiraagent:cost:<KEY>`, no expiry, newest 200 kept).
+
+- **See it:** `GET /usage/CA-7?token=<WEBHOOK_SECRET>` returns each round (requests, tokens, cost, and the calls behind them) plus the ticket total.
+- **Prices:** set `MODEL_PRICES` to JSON of USD per 1M tokens, `{"model name": [input, output]}`, using the exact model names. Prices are not built in because they change. A model that isn't listed shows its cost as unknown (null), and so does any round that used one; tokens and request counts are always kept. List free-tier models as `[0, 0]`.
+- **Slack:** the delivery message ends with `Cost this round: about $0.12 (ticket total $0.30)`, or `AI use this round: 5 requests, 42k tokens` when a price is missing. `SHOW_COST_IN_SLACK=false` hides it.
+- **Estimates:** Aider's token counts come from the `Tokens:` lines it prints, so costs are estimates. A call that times out before printing is not counted, and Aider's own internal retries are not visible.

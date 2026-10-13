@@ -515,7 +515,7 @@ class Planner:
                     issue, repo_dir, message=message, model=model, chat_mode="ask",
                     timeout=self.s.planner_timeout_seconds, extra_files=files,
                 )
-                self.job.add_tokens(*parse_aider_tokens(out))
+                self.job.add_tokens(*parse_aider_tokens(out), model=model, step="plan")
                 return out
 
             chat = chat_style(session)
@@ -574,5 +574,5 @@ class Planner:
             return known
         usage: dict[str, int] = {}
         found = discover_files(self.s.effective_planner_model, issue, owner_notes, tracked, repo_dir, usage, self.warnings)
-        self.job.add_tokens(usage.get("sent", 0), usage.get("received", 0))
+        self.job.add_tokens(usage.get("sent", 0), usage.get("received", 0), model=self.s.effective_planner_model, step="find_files")
         return merge_files([], found, tracked, repo_dir)

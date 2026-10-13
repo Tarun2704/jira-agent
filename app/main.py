@@ -14,6 +14,7 @@ import redis
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, Response
 
 from app.agent import CodingAgent
+from app.costs import summarize
 from app.config import get_settings
 from app.jira_client import JiraClient
 from app.jobs import Job, current_job, setup_logging, store
@@ -298,6 +299,19 @@ def runs(key: str, request: Request) -> dict:
     if not settings.planning_enabled:
         raise HTTPException(status_code=503, detail="run logs need plan-first mode (Redis)")
     return {"issue": key, "runs": _workflow().store.get_runs(key)}
+
+
+@app.get("/usage/{key}")
+def usage(key: str, request: Request) -> dict:
+    """What a ticket's model calls used and cost, per round and in total (tokens, requests, USD if MODEL_PRICES
+    lists the models). Kept in Redis without expiry. Auth: ?token=<WEBHOOK_SECRET> or 'Authorization: Bearer ...'."""
+    settings = get_settings()
+    token = request.query_params.get("token") or request.headers.get("authorization", "").removeprefix("Bearer ")
+    if not token or not hmac.compare_digest(token, settings.webhook_secret):
+        raise HTTPException(status_code=401, detail="invalid token")
+    if not settings.planning_enabled:
+        raise HTTPException(status_code=503, detail="cost records need plan-first mode (Redis)")
+    return {"issue": key, **summarize(_workflow().store.get_costs(key))}
 
 
 @app.post("/jira-webhook", status_code=202)

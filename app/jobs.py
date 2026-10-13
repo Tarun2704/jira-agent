@@ -90,6 +90,7 @@ class Job:
     runs: list[dict] = field(default_factory=list)  # each Aider run: prompt in, output out (see record_run)
     warnings: list[str] = field(default_factory=list)  # non-fatal problems the person should hear about
     delivery: dict = field(default_factory=dict)  # branch, PR number/url, diff and summary of what was delivered
+    calls: list[dict] = field(default_factory=list)  # each model call: step, model, tokens sent/received (see add_tokens)
     _t0: float = 0.0
 
     @property
@@ -119,9 +120,11 @@ class Job:
             "output_truncated": len(output) > MAX_RUN_OUTPUT,
         })
 
-    def add_tokens(self, sent: int, received: int) -> None:
+    def add_tokens(self, sent: int, received: int, model: str = "", step: str = "") -> None:
         self.tokens["sent"] += sent
         self.tokens["received"] += received
+        # One entry per model call (failed and fallback calls too): the cost record is built from these.
+        self.calls.append({"step": step, "model": model, "sent": sent, "received": received})
 
     def summary(self) -> str:
         steps = " ".join(f"{k}={v}s" for k, v in self.steps.items()) or "-"
@@ -141,6 +144,7 @@ class Job:
         d = asdict(self)
         d.pop("_t0")
         d["runs"] = len(d["runs"])  # /jobs shows only the count; the text is at /runs/<key>
+        d["calls"] = len(d["calls"])  # per-call detail and cost are at /usage/<key>
         d.pop("delivery", None)
         return d
 

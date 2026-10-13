@@ -65,6 +65,12 @@ class Settings(BaseSettings):
     # A "Looking into it..." message older than this, with nothing working on it, is closed on the next tick.
     ack_stale_seconds: int = 1800
 
+    # Cost tracking: USD per 1M tokens as JSON, {"model name": [input, output]}. Empty = costs show as unknown
+    # (tokens and request counts are still recorded). Free-tier models can be listed as [0, 0].
+    model_prices: str = ""
+    # Add "Used about $X" to the delivery message in Slack.
+    show_cost_in_slack: bool = True
+
     # Jira statuses the agent moves tickets to (empty = don't move). Must exist in the workflow.
     jira_status_in_progress: str = "In Progress"
     jira_status_in_review: str = "In Review"

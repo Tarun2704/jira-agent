@@ -24,6 +24,7 @@ from contextlib import contextmanager
 from app import slack_client as sc
 from app.agent import CodingAgent
 from app.config import Settings
+from app.costs import make_entry, money, parse_prices, summarize
 from app.friendly import explain, reference
 from app.github_client import GitHubClient
 from app.jira_client import JiraClient, mention
@@ -125,6 +126,36 @@ class Workflow:
             self.store.append_runs(job.issue_key, entries)
         except Exception:
             log.warning("Could not save the run log for %s", job.issue_key, exc_info=True)
+
+    def _save_cost(self, job: Job, kind: str) -> None:
+        """Keep what this job's model calls used and cost, under the ticket's current round. Never raises."""
+        if not job.calls:
+            return
+        try:
+            cur = self.store.get(job.issue_key)  # re-read: planning may just have started a new round
+            entry = make_entry(job.id, kind, cur.round_no if cur else 0, job.calls, parse_prices(self.s.model_prices))
+            self.store.append_cost(job.issue_key, entry)
+        except Exception:
+            log.warning("Could not save the cost record for %s", job.issue_key, exc_info=True)
+
+    def _cost_line(self, key: str, round_no: int) -> str:
+        """One short line for the delivery message: this round's use and the ticket total. "" if unknown/off."""
+        if not self.s.show_cost_in_slack:
+            return ""
+        try:
+            summary = summarize(self.store.get_costs(key))
+        except Exception:
+            return ""
+        this = next((r for r in summary["rounds"] if r["round"] == round_no), None)
+        if not this or not this["requests"]:
+            return ""
+        total = summary["total"]
+        if this["cost_usd"] is None:
+            return f"_AI use this round: {this['requests']} requests, {(this['sent'] + this['received']) // 1000}k tokens._"
+        line = f"_Cost this round: about {money(this['cost_usd'])}"
+        if len(summary["rounds"]) > 1 and total["cost_usd"] is not None:
+            line += f" (ticket total {money(total['cost_usd'])})"
+        return line + "._"
 
     def _jira_comment(self, key: str, body: str, tries: int = 0) -> None:
         """Comment on the ticket. If Jira refuses, keep the comment and retry on the next tick."""
@@ -251,6 +282,7 @@ class Workflow:
                 job.finish("failed", self._scrub(str(e))[-500:])
             finally:
                 self._save_runs(job, "plan")
+                self._save_cost(job, "plan")
 
     def _round_context(self, issue, s: Session) -> str:
         """New input for a follow-up round: human comments on the Jira ticket since the last round."""
@@ -804,6 +836,7 @@ class Workflow:
                 CodingAgent(self.s, job, plan=approved_plan_text(s), plan_files=s.files, followup=followup, deletions=s.delete_files).handle_issue(key)
             finally:
                 self._save_runs(job, "execute")
+                self._save_cost(job, "execute")
             self._finish_execution(s, job)
 
     @staticmethod
@@ -871,6 +904,10 @@ class Workflow:
             msg = f":x: *{key}*: I couldn't finish this. {explain(job.detail or '')}\nReply here to try again.{reference(job.id)}"
         for w in job.warnings:
             msg += f"\n:warning: {w}"
+        if job.status != "skipped":
+            cost = self._cost_line(key, n)
+            if cost:
+                msg += f"\n{cost}"
         fresh = self.store.get(key) or s
         ref = self._say(fresh, self._scrub(msg), important=True)
         if ref:  # replies under the result message belong to this ticket

@@ -358,7 +358,7 @@ class CodingAgent:
             crlf = crlf_files(repo_dir)
             with job.step("aider"):  # the prompt tells the model which files are already gone, so it does the rest of the plan
                 aider_log = self._run_aider(issue, repo_dir)
-            job.add_tokens(*parse_aider_tokens(aider_log))
+            job.add_tokens(*parse_aider_tokens(aider_log), model=self.s.aider_model, step="code")
             restore_crlf(repo_dir, crlf)
             if self.deleted and llm_problem(aider_log):
                 job.warnings.append("The AI service had a problem, so only the file deletions were made; the rest of the plan was not done. " + explain(llm_problem(aider_log)))
@@ -372,7 +372,7 @@ class CodingAgent:
                     time.sleep(self.s.rate_limit_wait_seconds)
                     with job.step("aider_retry"):
                         aider_log = self._run_aider(issue, repo_dir)
-                    job.add_tokens(*parse_aider_tokens(aider_log))
+                    job.add_tokens(*parse_aider_tokens(aider_log), model=self.s.aider_model, step="code_retry")
                     restore_crlf(repo_dir, crlf)
                     self._git("add", "-A", cwd=repo_dir)
                     first_problem = llm_problem(aider_log)
@@ -381,7 +381,7 @@ class CodingAgent:
                     job.warnings.append("The main AI service wasn't available, so a backup service did the work.")
                     with job.step("aider_fallback"):
                         aider_log = self._run_aider(issue, repo_dir, model=self.s.aider_fallback_model)
-                    job.add_tokens(*parse_aider_tokens(aider_log))
+                    job.add_tokens(*parse_aider_tokens(aider_log), model=self.s.aider_fallback_model, step="code_fallback")
                     restore_crlf(repo_dir, crlf)
                     self._git("add", "-A", cwd=repo_dir)
             if not self._git("status", "--porcelain", cwd=repo_dir).strip():
@@ -410,7 +410,7 @@ class CodingAgent:
                 description = describe_changes(
                     self.s.aider_model, issue, self._git("diff", "--cached", cwd=repo_dir), usage=usage
                 )
-            job.add_tokens(usage.get("sent", 0), usage.get("received", 0))
+            job.add_tokens(usage.get("sent", 0), usage.get("received", 0), model=self.s.aider_model, step="pr_description")
             if description is None:
                 log.warning("PR description generation failed; using fallback description")
             summary = summary_line(description)
@@ -507,7 +507,7 @@ class CodingAgent:
             fix_log = self._run_aider(
                 issue, repo_dir, message=build_fix_prompt(issue, result.errors), files=result.failed_files
             )
-        self.job.add_tokens(*parse_aider_tokens(fix_log))
+        self.job.add_tokens(*parse_aider_tokens(fix_log), model=self.s.aider_model, step="fix")
         restore_crlf(repo_dir, crlf)
         self._git("add", "-A", cwd=repo_dir)
 

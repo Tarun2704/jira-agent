@@ -206,6 +206,15 @@ class SessionStore:
     def has_lease(self, key: str) -> bool:
         return bool(self.r.exists(self._lease(key)))
 
+    # ---- tick lock: only one tick runs at a time, across instances (deploy overlap, local + prod) -------
+
+    def acquire_tick_lock(self, owner: str, ttl: int) -> bool:
+        return bool(self.r.set(f"{PREFIX}ticklock", owner, nx=True, ex=ttl))
+
+    def release_tick_lock(self, owner: str) -> None:
+        if self.r.get(f"{PREFIX}ticklock") == owner:
+            self.r.delete(f"{PREFIX}ticklock")
+
     # ---- Slack bookkeeping ---------------------------------------------------------------
 
     def map_thread(self, channel: str, thread_ts: str, key: str) -> None:

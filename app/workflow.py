@@ -68,6 +68,7 @@ class Workflow:
         self._github = github_factory or (lambda: GitHubClient(settings))
         self._sleep = time.sleep  # (tests replace it)
         self.deferred_triggers: set[str] = set()  # tickets whose start failed (Redis down); retried on the next tick
+        self._tick_guard = threading.Lock()  # one tick at a time in this process (the Redis lock covers other instances)
 
     # ---- helpers -------------------------------------------------------------------
 
@@ -916,6 +917,28 @@ class Workflow:
     # ---- the periodic tick (called by an external pinger every ~10 minutes) --------------------
 
     def tick(self) -> dict:
+        """Run one tick unless another is already running (here or on another instance); then it just says so.
+
+        Overlapping ticks (self-ping plus an outside pinger, a slow tick, two instances during a deploy) could
+        otherwise send a reminder or a PR-comment prompt twice. If Redis is down the lock raises, like the tick would.
+        """
+        if not self._tick_guard.acquire(blocking=False):
+            return {"skipped": "a tick is already running"}
+        owner = uuid.uuid4().hex
+        try:
+            if not self.store.acquire_tick_lock(owner, self.s.tick_lock_seconds):
+                return {"skipped": "a tick is already running on another instance"}
+            try:
+                return self._tick_body()
+            finally:
+                try:
+                    self.store.release_tick_lock(owner)
+                except Exception:
+                    log.warning("Could not release the tick lock (it expires by itself)", exc_info=True)
+        finally:
+            self._tick_guard.release()
+
+    def _tick_body(self) -> dict:
         """Recover crashed jobs, nudge people who haven't replied, watch delivered PRs. Cheap enough to call often."""
         out = {"checked": 0, "requeued": [], "reminded": [], "merged": [], "reviews": [], "expired": [], "stale": [], "retried": []}
         for key in sorted(self.deferred_triggers):  # starts that failed because storage was down

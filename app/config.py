@@ -65,6 +65,19 @@ class Settings(BaseSettings):
     # A "Looking into it..." message older than this, with nothing working on it, is closed on the next tick.
     ack_stale_seconds: int = 1800
 
+    # The app calls its own public /tick every SELF_PING_INTERVAL_SECONDS. That runs the tick without an outside
+    # pinger and, on Render's free tier, counts as traffic so the service doesn't go to sleep. Needs the public URL:
+    # Render provides it as RENDER_EXTERNAL_URL; set SELF_PING_URL to use another address. Off when neither is set
+    # (e.g. on your own machine) or when SELF_PING_ENABLED=false.
+    self_ping_enabled: bool = True
+    self_ping_url: str = ""
+    render_external_url: str = ""  # set by Render itself
+    self_ping_interval_seconds: int = 600
+    # After this many failed self-pings in a row you get one Slack message (and one when it recovers).
+    self_ping_alert_after: int = 3
+    # A running tick holds a lock this long at most (a crashed tick can't block the next ones forever).
+    tick_lock_seconds: int = 300
+
     # Cost tracking: USD per 1M tokens as JSON, {"model name": [input, output]}. Empty = costs show as unknown
     # (tokens and request counts are still recorded). Free-tier models can be listed as [0, 0].
     model_prices: str = ""
@@ -99,6 +112,13 @@ class Settings(BaseSettings):
             if not self.redis_url.startswith(("redis://", "rediss://", "unix://")):
                 problems.append("REDIS_URL must start with rediss:// (Upstash) or redis://.")
         return problems
+
+    @property
+    def self_ping_base(self) -> str:
+        """The public address to ping, or "" when self-ping should not run."""
+        if not (self.self_ping_enabled and self.planning_enabled and self.tick_token):
+            return ""
+        return (self.self_ping_url or self.render_external_url).strip()
 
     @property
     def effective_planner_model(self) -> str:

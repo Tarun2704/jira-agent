@@ -1,4 +1,5 @@
-"""The planner: reads the repo (Aider in read-only `ask` mode) and writes a short plan.
+"""The planner: reads the repo and writes a short plan. PLANNER_BACKEND picks who reads it: Aider in read-only `ask`
+mode (default), or OpenCode with no edit/shell rights (searches the code itself; better on big repos, more requests).
 
 Each call is stateless, since Aider keeps nothing between runs. The conversation (your answers,
 earlier questions, the current plan) is stored in Redis and fed back into the prompt each time.
@@ -13,12 +14,13 @@ from pathlib import Path
 
 from app.friendly import explain
 from app.agent import (
-    MAX_CONTEXT_FILE_BYTES, MAX_CONTEXT_FILES, AgentError, CodingAgent, empty_reply, llm_problem, merge_files,
-    aider_reply, is_rate_limit, mentioned_files, retryable_llm_problem,
+    MAX_CONTEXT_FILE_BYTES, MAX_CONTEXT_FILES, AgentError, CodingAgent, coder_empty, coder_problem, llm_problem, merge_files,
+    aider_reply, is_rate_limit, mentioned_files, retryable_llm_problem, strip_credentials,
 )
+from app import opencode_runner as oc
 from app.config import Settings
 from app.jira_client import JiraIssue
-from app.jobs import Job, parse_aider_tokens
+from app.jobs import Job
 from app.pr_writer import _complete
 from app.store import Session
 
@@ -203,9 +205,11 @@ def parse_paths(reply: str, allowed: set[str], limit: int = MAX_CONTEXT_FILES) -
 
 def discover_files(
     model: str, issue: JiraIssue, notes: str, tracked: list[str], repo_dir: Path, usage: dict | None = None,
-    warnings: list[str] | None = None,
+    warnings: list[str] | None = None, fallback: str = "",
 ) -> list[str]:
-    """Ask the model which repo files matter. [] if it can't tell or the call fails (planning goes on)."""
+    """Ask the model which repo files matter. [] if it can't tell or the call fails (planning goes on).
+    `fallback` (PLANNER_FALLBACK_MODEL) is tried once if the main model is down, rate-limited or misconfigured;
+    usage["model"] says which one answered."""
     paths = candidate_paths(tracked, repo_dir, f"{issue.summary}\n{issue.description}\n{notes}")
     if not paths:
         return []
@@ -218,9 +222,17 @@ def discover_files(
         limit=MAX_CONTEXT_FILES,
     )
     try:
-        reply, call_usage = _complete(model, prompt)
+        try:
+            reply, call_usage = _complete(model, prompt)
+        except Exception as e:
+            problem = llm_problem(f"{type(e).__name__}: {e}")
+            if not (fallback and retryable_llm_problem(problem)):
+                raise
+            log.warning("File discovery: %s failed (%s); trying %s", model, (problem or "").splitlines()[0], fallback)
+            model = fallback
+            reply, call_usage = _complete(model, prompt)
         if usage is not None:
-            usage.update(call_usage)
+            usage.update(call_usage, model=model)
     except Exception as e:
         log.warning("File discovery failed for %s; planning without it", issue.key, exc_info=True)
         if warnings is not None:
@@ -478,6 +490,16 @@ def approved_plan_text(session: Session) -> str:
     return body
 
 
+def stopped_problem(output: str, s: Settings) -> str | None:
+    """Why an OpenCode planning run was cut off, if it was (Aider runs are one call and never are)."""
+    if "[stopped] step limit" in output:
+        return (f"The planning agent used up its limit of {s.opencode_plan_max_steps} model requests (OPENCODE_PLAN_MAX_STEPS) "
+                "before writing the plan. Name the files in the ticket, or raise the limit.")
+    if "[stopped] timed out" in output:
+        return f"Planning took longer than PLANNER_TIMEOUT_SECONDS ({s.planner_timeout_seconds}s) and was stopped."
+    return None
+
+
 class Planner:
     def __init__(self, settings: Settings, job: Job):
         self.s = settings
@@ -501,7 +523,9 @@ class Planner:
                 a._run(["git", "clone", "--depth", "50", "--branch", branch or base, clone_url, str(repo_dir)],
                        cwd=repo_dir.parent, timeout=300)
                 with open(repo_dir / ".git" / "info" / "exclude", "a") as f:
-                    f.write("\n.aider*\n")
+                    f.write("\n.aider*\n.opencode/\n")
+                # The planner never pushes: drop the token from the clone so nothing that reads .git/config sees it.
+                a._git("remote", "set-url", "origin", strip_credentials(clone_url), cwd=repo_dir)
             tracked = [p for p in a._git("ls-files", "-z", cwd=repo_dir).split("\0") if p]
 
             with self.job.step("find_files"):
@@ -510,31 +534,47 @@ class Planner:
 
             message = build_planner_prompt(issue, session, context) + repo_listing(tracked, repo_dir)
 
+            backend = self.s.planner_backend_used
+            main_model, fallback = (
+                (self.s.opencode_planner_model or self.s.opencode_model, self.s.opencode_fallback_model) if backend == "opencode"
+                else (self.s.effective_planner_model, self.s.planner_fallback_model)
+            )
+
+            def problem_of(out: str) -> str | None:
+                return coder_problem(out, backend) or stopped_problem(out, self.s)
+
             def ask(model: str) -> str:
+                if backend == "opencode":
+                    out = a.run_opencode_readonly(
+                        issue, repo_dir, oc.build_plan_prompt(message, files), model=model, step="plan",
+                        timeout=self.s.planner_timeout_seconds, max_steps=self.s.opencode_plan_max_steps,
+                    )
+                    # its tools work with absolute paths, which then show up in the plan ("/tmp/.../CA-7-plan/x.py")
+                    return out.replace(f"{repo_dir.resolve()}/", "").replace(f"{repo_dir}/", "")
                 out = a._run_aider(
                     issue, repo_dir, message=message, model=model, chat_mode="ask",
                     timeout=self.s.planner_timeout_seconds, extra_files=files,
                 )
-                self.job.add_tokens(*parse_aider_tokens(out), model=model, step="plan")
+                self.job.add_aider(out, model=model, step="plan")
                 return out
 
             chat = chat_style(session)
             parse = parse_chat_output if chat else parse_planner_output
-            with self.job.step("aider_plan"):
-                output = ask(self.s.effective_planner_model)
-                problem = llm_problem(output)
-                if parse(output) is None and is_rate_limit(problem) and not self.s.planner_fallback_model and self.s.rate_limit_wait_seconds:
+            with self.job.step(f"{backend}_plan"):
+                output = ask(main_model)
+                problem = problem_of(output)
+                if parse(output) is None and is_rate_limit(problem) and not fallback and self.s.rate_limit_wait_seconds:
                     log.warning("Planner rate limited; waiting %ss and retrying once", self.s.rate_limit_wait_seconds)
                     self.warnings.append("The AI service was busy, so I waited a moment and tried again.")
                     time.sleep(self.s.rate_limit_wait_seconds)
-                    output = ask(self.s.effective_planner_model)
-                    problem = llm_problem(output)
-                if parse(output) is None and retryable_llm_problem(problem) and self.s.planner_fallback_model:
-                    log.warning("Planner model failed (%s); retrying with %s", problem.splitlines()[0], self.s.planner_fallback_model)
+                    output = ask(main_model)
+                    problem = problem_of(output)
+                if parse(output) is None and retryable_llm_problem(problem) and fallback:
+                    log.warning("Planner model failed (%s); retrying with %s", problem.splitlines()[0], fallback)
                     self.warnings.append(
-                        "The main AI service wasn't available, so a backup service wrote this plan."
+                        f"The main AI model ({main_model}) wasn't available, so the backup model ({fallback}) wrote this plan."
                     )
-                    output = ask(self.s.planner_fallback_model)
+                    output = ask(fallback)
                     used_fallback = True
         finally:
             shutil.rmtree(repo_dir, ignore_errors=True)
@@ -542,11 +582,11 @@ class Planner:
         result = parse(output)
         if result is None:
             log.warning("Planner reply not in the expected layout. Tail: %s", output[-800:].replace("\n", " | "))
-            problem = llm_problem(output) or (
-                "The model returned an empty reply (possibly blocked by its content filter)." if empty_reply(output) else None
+            problem = problem_of(output) or (
+                "The model returned an empty reply (possibly blocked by its content filter)." if coder_empty(output, backend) else None
             )
             if problem and used_fallback:
-                problem = f"The fallback model {self.s.planner_fallback_model} was tried after the main model failed, and it failed too: {problem}"
+                problem = f"The fallback model {fallback} was tried after the main model failed, and it failed too: {problem}"
             if problem:
                 extra = f"\nAider's output ended with:\n{aider_reply(output, 700)}" if "couldn't apply the model's edit" in problem else ""
                 raise AgentError(f"The LLM call failed. {problem}{extra}")
@@ -570,9 +610,11 @@ class Planner:
         owner_notes = "\n".join(m["text"] for m in session.messages if m["role"] == "user")
         scan = dataclasses.replace(issue, description=f"{issue.description}\n{owner_notes}")
         known = merge_files(mentioned_files(scan, tracked, repo_dir), session.files, tracked, repo_dir)
-        if known:
+        if known or self.s.planner_backend_used == "opencode":  # (OpenCode searches the code itself)
             return known
         usage: dict[str, int] = {}
-        found = discover_files(self.s.effective_planner_model, issue, owner_notes, tracked, repo_dir, usage, self.warnings)
-        self.job.add_tokens(usage.get("sent", 0), usage.get("received", 0), model=self.s.effective_planner_model, step="find_files")
+        found = discover_files(self.s.effective_planner_model, issue, owner_notes, tracked, repo_dir, usage, self.warnings,
+                               fallback=self.s.planner_fallback_model)
+        self.job.add_tokens(usage.get("sent", 0), usage.get("received", 0), model=usage.get("model", self.s.effective_planner_model),
+                            step="find_files", reported_cost=usage.get("cost"))
         return merge_files([], found, tracked, repo_dir)

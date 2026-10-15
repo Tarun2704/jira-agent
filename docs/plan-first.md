@@ -24,6 +24,7 @@ If `SLACK_BOT_TOKEN`, `SLACK_USER_ID` or `REDIS_URL` is empty, the old straight-
 | `REDIS_URL` | `rediss://default:<password>@<host>:6379` (Upstash free tier works) |
 | `TICK_TOKEN` | Secret for `GET /tick?token=…` |
 | `PLANNER_MODEL` | Model for plans and revisions. Empty = same as `AIDER_MODEL` |
+| `WATCHDOG_SECONDS` | How often the app re-queues crashed jobs and re-sends Slack messages held back by an outage (default 60; 0 = off) |
 | `PLAN_REMINDER_HOURS` | No reply after this long → Jira comment tagging the reporter (default 48) |
 | `PLAN_WORKERS` | How many plans/revisions run at once (1 to 4, default 1). Each is a clone plus an Aider process (roughly 200-300 MB), so keep 1 on a 512 MB instance |
 | `SEPARATE_PLAN_QUEUE` | `true` (default): plans/revisions have their own worker. `false`: share the single coding worker |
@@ -34,9 +35,11 @@ Settings are read from the environment (and `.env` locally) by `app/config.py`. 
 
 One JSON session per ticket (status, plan, chat history, Slack thread), a short-lived **lease** per running job, the set of active tickets, and Slack event ids (Slack redelivers events). Finished sessions expire after 30 days. Nothing polls Redis, so Upstash's 500k commands/month is plenty.
 
-## Crash recovery: `/tick`
+## Crash recovery: the watchdog and `/tick`
 
-A running job refreshes its lease every ~100 s. If the process dies, the lease lapses (5 min) and the next `/tick` sees a session that should be running but has no lease, and re-queues it. A re-run starts from scratch, which is safe for the same reasons as before (fresh clone, force-pushed `ai/` branch, open-PR check).
+A running job refreshes its lease every ~100 s. If the process dies, the lease lapses (5 min). The app's own **watchdog** (every `WATCHDOG_SECONDS`, default 60) then sees a session that should be running but has no lease and re-queues it, so recovery takes about 5–6 minutes without anyone calling `/tick`; `/tick` does the same check as a backup. A re-run starts from scratch, which is safe for the same reasons as before (fresh clone, force-pushed `ai/` branch, open-PR check), and a run that had already pushed its commit before dying is recognised by the commit's `Agent-Delivery` stamp and recorded instead of redone. A job that finds the lease taken (another process, or one that just died) tries again when it lapses.
+
+**Slack outages:** a message that can't be posted after a few tries is kept in Redis and sent by the watchdog once Slack answers again, oldest first, marked "Delayed: Slack couldn't be reached at HH:MM". Results and failures are also written to the Jira ticket straight away, so they aren't late.
 
 `/tick` also sends the "no reply" reminder once per wait. A reply resets the clock.
 
@@ -61,6 +64,27 @@ That call also keeps the free instance awake.
 7. Optional, to see crash recovery and reminders: `curl "http://localhost:8000/tick?token=<TICK_TOKEN>"`.
 
 For production, put the Render URL in the two Slack fields instead of the tunnel, and add the pinger.
+
+### Running on a server: the current setup (since 2026-10-14)
+
+The live app runs on Oracle Cloud's **Always Free AMD VM** `jira-agent-micro` (Hyderabad; 2 small vCPUs, 1 GB memory,
+45 GB disk, Ubuntu 24.04; SSH: `ssh -i ~/.ssh/oracle_jira_agent ubuntu@<ip>`, the IP is in `~/.oci/jira-agent-micro.ip`).
+Three containers, each restarting by itself (also after a reboot): `jira-agent-redis` (data in the volume
+`jira-agent-redis-data`), `jira-agent` (the app) and `jira-agent-ngrok` (the tunnel on
+`https://<your-static-domain>.ngrok-free.dev`, so Slack's two URLs and the Jira webhook `coding-agent-local` point
+there unchanged). The laptop runs nothing; the Render webhook (`coding-agent`) is disabled.
+
+- **First start / after changing `.env`:** copy `.env` to the server (`scp -i ~/.ssh/oracle_jira_agent .env ubuntu@<ip>:~/jira-agent/`),
+  then on the server `cd ~/jira-agent && sudo NGROK_AUTHTOKEN=... NGROK_URL=https://...ngrok-free.dev ./scripts/vm-start.sh`.
+- **Deploy code changes:** `./scripts/vm-deploy.sh` from the laptop (copies the code, builds on the server, restarts the
+  app; ~15 s when only app code changed, several minutes when `requirements.txt` changed).
+- **1 GB is tight:** the server has a 2 GB swap file and runs **one job at a time** (`SEPARATE_PLAN_QUEUE=false`, set by
+  the scripts on servers under ~1.8 GB). Measured: an OpenCode plan peaked at 769 MB of memory plus 313 MB of swap and
+  took ~100 s (vs ~45 s on a laptop). Without swap it would be killed.
+- **Bigger server later** (e.g. the free ARM VM, still being retried every 10 minutes by `~/.oci/jira-agent-vm-retry.sh`):
+  run the same three steps there (Docker, copy code and `.env`, `vm-start.sh`), copy the Redis data across, stop ngrok
+  on the old one first (the free ngrok plan allows one connection). On 2 GB+ the scripts keep planning and coding in
+  parallel.
 
 ## The queue
 
@@ -134,7 +158,7 @@ When coding finishes the ticket becomes **delivered**, not finished. It stays op
 - **GitHub review comments.** `/tick` polls the PR. New human comments are offered once in Slack with **Plan changes from these** / **Ignore**; Plan changes starts a round with the comments as the request.
 - **Which branch?** Decided when you confirm (the confirm message says which): an open or draft PR gets a new commit on the same branch and a comment on the PR; a closed or merged PR (or none) starts fresh from the main branch as `ai/KEY-r<n>` with a new PR that links the previous one. If GitHub can't be reached the round fails with a message and the ticket stays delivered.
 - **Context the planner and coder get:** the ticket, every earlier round (request, plan, files, summary, outcome, PR, last diff), new Jira comments by people since the last round, the review comments and the Slack conversation.
-- **Merged = completed.** `/tick` notices a merged PR, marks the ticket completed, and tells you in Slack and Jira. Later Slack messages about it are answered with "ticket is completed; create a new Jira ticket (or update the description and re-add the label)". A Jira re-trigger of a completed ticket starts a new session on a new branch with the earlier rounds as history. After the window passes with no activity the ticket is completed too. A closed, unmerged PR is announced once; the ticket stays delivered.
+- **Merged = completed.** `/tick` notices a merged PR, marks the ticket completed, moves the Jira ticket to `JIRA_STATUS_DONE` (default `Done`; empty = don't move), and tells you in Slack and Jira. A PR approval on its own changes nothing. Later Slack messages about it are answered with "ticket is completed; create a new Jira ticket (or update the description and re-add the label)". A Jira re-trigger of a completed ticket starts a new session on a new branch with the earlier rounds as history. After the window passes with no activity the ticket is completed too. A closed, unmerged PR is announced once; the ticket stays delivered.
 
 ## Errors and fallbacks
 
@@ -174,9 +198,13 @@ The technical details stay on the server: the Render logs (every line is tagged 
 Every model call (file search, planning, coding, syntax fix, PR description, and any retry or fallback call) is recorded with its model and token counts. When a planning or coding job ends, one record per job is saved in Redis under the ticket and its round (`jiraagent:cost:<KEY>`, no expiry, newest 200 kept).
 
 - **See it:** `GET /usage/CA-7?token=<WEBHOOK_SECRET>` returns each round (requests, tokens, cost, and the calls behind them) plus the ticket total.
-- **Prices:** set `MODEL_PRICES` to JSON of USD per 1M tokens, `{"model name": [input, output]}`, using the exact model names. Prices are not built in because they change. A model that isn't listed shows its cost as unknown (null), and so does any round that used one; tokens and request counts are always kept. List free-tier models as `[0, 0]`.
+- **Where the cost comes from, in order:**
+  1. The built-in price (`DEFAULT_PRICES` in `app/costs.py`: the Claude and Gemini models this service uses) or `MODEL_PRICES`, which adds models and overrides built-in prices (your own prices win): JSON of USD per 1M tokens, `{"model name": [input, output]}`, or `[input, output, cache_write, cache_hit]` for models with prompt caching (with two numbers, cache tokens are billed at the input price).
+  2. The cost the model layer already reported for that call: Aider prints `Cost: $...` and litellm computes one for the file search and PR description, both from list prices of the models it knows. Free-tier models therefore show a list-price cost, not $0. This works without any setup.
+  3. Otherwise unknown (`null`), and the Slack line shows requests and tokens instead. A call that printed no usage at all (it failed early) counts as $0 and doesn't make the round unknown.
+  Each call in `/usage` has a `cost_source` (`configured`, `reported` or `no usage`).
 - **Slack:** the delivery message ends with `Cost this round: about $0.12 (ticket total $0.30)`, or `AI use this round: 5 requests, 42k tokens` when a price is missing. `SHOW_COST_IN_SLACK=false` hides it.
-- **Estimates:** Aider's token counts come from the `Tokens:` lines it prints, so costs are estimates. A call that times out before printing is not counted, and Aider's own internal retries are not visible.
+- **Estimates:** Aider's token counts come from the `Tokens:` lines it prints and are rounded (7.2k), so costs computed from `MODEL_PRICES` are estimates; Aider's own `Cost:` figure is exact for the call. Records saved before this change keep whatever cost they had. A call that times out before printing is not counted, and Aider's own internal retries are not visible.
 
 ## Self-ping (keeps /tick running)
 

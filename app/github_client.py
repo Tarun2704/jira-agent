@@ -35,6 +35,20 @@ class GitHubClient:
                 return pr["html_url"]
         return None
 
+    def branch_head_message(self, branch: str) -> str | None:
+        """The message of the newest commit on `branch`, or None if the branch doesn't exist."""
+        r = self._client.get(f"/repos/{self.repo}/commits/{branch}")
+        if r.status_code in (404, 422):
+            return None
+        r.raise_for_status()
+        return r.json()["commit"]["message"]
+
+    def open_pr_for_branch(self, branch: str) -> dict | None:
+        r = self._client.get(f"/repos/{self.repo}/pulls", params={"state": "open", "head": f"{self.repo.split('/')[0]}:{branch}"})
+        r.raise_for_status()
+        prs = r.json()
+        return {"number": prs[0]["number"], "url": prs[0]["html_url"], "branch": branch} if prs else None
+
     def create_pr(self, *, head: str, base: str, title: str, body: str, draft: bool) -> str:
         payload = {"head": head, "base": base, "title": title, "body": body, "draft": draft}
         r = self._client.post(f"/repos/{self.repo}/pulls", json=payload)

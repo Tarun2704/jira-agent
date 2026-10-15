@@ -268,3 +268,33 @@ def test_planning_slots_follow_plan_workers(monkeypatch):
     config.get_settings.cache_clear()
     gate = main._plan_slot()
     assert sum(gate.acquire(blocking=False) for _ in range(10)) == 4  # capped at the thread count
+
+
+def test_the_watchdog_runs_with_the_app(monkeypatch):
+    import threading
+
+    from fastapi.testclient import TestClient
+
+    from app import config, main
+
+    monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-x")
+    monkeypatch.setenv("SLACK_USER_ID", "U1")
+    monkeypatch.setenv("REDIS_URL", "redis://fake")
+    monkeypatch.setenv("WATCHDOG_SECONDS", "1")
+    config.get_settings.cache_clear()
+    runs = threading.Event()
+
+    class FakeWorkflow:
+        def watchdog(self):
+            runs.set()
+            return {"requeued": [], "slack_sent": 0}
+
+        def tick(self):
+            return {}
+
+    monkeypatch.setattr(main, "_workflow", lambda: FakeWorkflow())
+    monkeypatch.setattr(main, "_startup_checks", lambda: None)
+    with TestClient(main.app):
+        assert any(t.name == "watchdog" for t in threading.enumerate())
+        assert runs.wait(5)
+    config.get_settings.cache_clear()

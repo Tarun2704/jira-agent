@@ -1,4 +1,5 @@
 """Settings loaded from environment variables (or a local .env file)."""
+import shutil
 from functools import lru_cache
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -30,6 +31,24 @@ class Settings(BaseSettings):
     # A rate-limited model run (no fallback model set) waits this long and tries once more; 0 = don't
     rate_limit_wait_seconds: int = 45
 
+    # --- Coding backend: who edits the files. "aider" (default, unchanged) or "opencode" (an agent that explores the
+    # repo, edits and can run tests). Only the CODING step switches; planning, PR descriptions, git, Jira and Slack are
+    # the same for both. Change it, redeploy/restart, and run the same ticket again to compare cost and quality.
+    coding_backend: str = "aider"
+    opencode_bin: str = "opencode"
+    # OpenCode model ids are provider/model, e.g. google/gemini-2.5-flash (reads GEMINI_API_KEY), openrouter/<model>, openai/<model>.
+    opencode_model: str = "google/gemini-2.5-flash"
+    opencode_fallback_model: str = ""  # used once, like AIDER_FALLBACK_MODEL, when the main model is rate-limited or down
+    opencode_timeout_seconds: int = 900
+    # Stop the run after this many model requests (each tool-use round trip is one). 0 = no cap. Bounds cost per ticket.
+    opencode_max_steps: int = 40
+    # false (default) = the agent may not run shell commands (it can still read, search and edit). true = it may run
+    # commands such as the repo's tests, but then ticket text could try to make it run something harmful: read docs/opencode.md first.
+    opencode_allow_bash: bool = False
+    opencode_variant: str = ""  # provider-specific reasoning effort (e.g. low/high), passed as --variant. Empty = model default
+    opencode_pass_env: str = ""  # extra env var NAMES (comma separated) to hand to the agent, e.g. for a custom provider key
+    opencode_extra_config: str = ""  # JSON merged into the generated OpenCode config (e.g. a custom provider)
+
     # Webhook auth: Jira's HMAC secret, also accepted as ?token=<secret>
     webhook_secret: str
 
@@ -49,6 +68,14 @@ class Settings(BaseSettings):
     # Model for planning/revising. Empty = same as AIDER_MODEL (change later for a stronger one).
     planner_model: str = ""
     planner_timeout_seconds: int = 600
+    # Who reads the code and writes the plan (independent of CODING_BACKEND):
+    #   "opencode" (default): a read-only OpenCode run (no edits, no shell) that searches file contents and reads the
+    #     code it plans to change. Right on big repos; ~3x the model requests (see docs/planner-comparison.md).
+    #   "aider": ~2 model requests. Files come from the ticket or from matching their PATHS against the ticket's words,
+    #     plus Aider's repo map. Cheaper; fine on small repos, but on big ones it can plan around code it never saw.
+    planner_backend: str = "opencode"
+    opencode_planner_model: str = ""  # provider/model for the OpenCode planner. Empty = OPENCODE_MODEL
+    opencode_plan_max_steps: int = 20  # model requests one OpenCode plan may use
     plan_reminder_hours: int = 48  # no reply for this long -> Jira comment tagging the reporter
     lease_seconds: int = 300  # a running job refreshes its lease; a lapsed lease = crashed job
     # Planning/revising gets its own single worker, so a long coding run never delays your replies.
@@ -77,9 +104,12 @@ class Settings(BaseSettings):
     self_ping_alert_after: int = 3
     # A running tick holds a lock this long at most (a crashed tick can't block the next ones forever).
     tick_lock_seconds: int = 300
+    # Every this many seconds the app itself re-queues tickets whose job died (no lease) and re-sends Slack messages
+    # that couldn't be delivered. 0 = off (then only /tick does the first, and nothing does the second).
+    watchdog_seconds: int = 60
 
-    # Cost tracking: USD per 1M tokens as JSON, {"model name": [input, output]}. Empty = costs show as unknown
-    # (tokens and request counts are still recorded). Free-tier models can be listed as [0, 0].
+    # Cost tracking: prices for the usual models are built in (app/costs.py DEFAULT_PRICES). This adds models or
+    # overrides a built-in price: USD per 1M tokens as JSON, {"model name": [input, output]}. Free tiers: [0, 0].
     model_prices: str = ""
     # Add "Used about $X" to the delivery message in Slack.
     show_cost_in_slack: bool = True
@@ -88,6 +118,7 @@ class Settings(BaseSettings):
     jira_status_in_progress: str = "In Progress"
     jira_status_in_review: str = "In Review"
     jira_status_on_failure: str = "To Do"  # failed or no changes
+    jira_status_done: str = "Done"  # the PR was merged. Empty = don't move the ticket
     open_draft_pr: bool = True
     workdir: str = "/tmp/jira-agent"
 
@@ -111,6 +142,34 @@ class Settings(BaseSettings):
                 problems.append("TICK_TOKEN is empty: /tick is disabled, so crashed jobs and reminders are never recovered.")
             if not self.redis_url.startswith(("redis://", "rediss://", "unix://")):
                 problems.append("REDIS_URL must start with rediss:// (Upstash) or redis://.")
+        if self.planner_backend.strip().lower() not in ("aider", "opencode"):
+            problems.append(f"PLANNER_BACKEND={self.planner_backend!r} is not 'aider' or 'opencode': using OpenCode.")
+        if self.coding_backend.strip().lower() not in ("aider", "opencode"):
+            problems.append(f"CODING_BACKEND={self.coding_backend!r} is not 'aider' or 'opencode': using Aider.")
+        users = [n for n, b in (("CODING_BACKEND", self.backend), ("PLANNER_BACKEND", self.planner_backend_used)) if b == "opencode"]
+        if users:  # OpenCode plans and/or codes
+            if not shutil.which(self.opencode_bin):
+                problems.append(f"{' and '.join(users)}=opencode but `{self.opencode_bin}` is not installed on this machine: "
+                                f"those jobs will fail. Install it, or set {'/'.join(users)}=aider.")
+            models = [("OPENCODE_MODEL", self.opencode_model), ("OPENCODE_FALLBACK_MODEL", self.opencode_fallback_model)]
+            if self.planner_backend_used == "opencode":
+                models.append(("OPENCODE_PLANNER_MODEL", self.opencode_planner_model))
+            for name, model in models:
+                if not model:
+                    continue
+                if "/" not in model:
+                    problems.append(f"{name} must look like provider/model (e.g. google/gemini-2.5-flash).")
+                elif model.startswith("gemini/"):  # the Aider/litellm spelling: OpenCode answers "Provider not found: gemini"
+                    problems.append(f"{name}={model!r} uses Aider's name for Google; OpenCode needs google/{model.split('/', 1)[1]}.")
+            from app.opencode_runner import MIN_MEMORY_MB, container_memory_mb
+
+            mem = container_memory_mb()
+            if mem is not None and mem < MIN_MEMORY_MB:
+                problems.append(
+                    f"This instance has about {mem} MB of memory; one OpenCode run needs roughly 550 MB on top of the app, so "
+                    f"{' and '.join(users)}=opencode jobs will likely be killed (out of memory). Use an instance with at least "
+                    f"1 GB (2 GB if planning and coding can run at the same time), or set {'/'.join(users)}=aider."
+                )
         return problems
 
     @property
@@ -123,6 +182,24 @@ class Settings(BaseSettings):
     @property
     def effective_planner_model(self) -> str:
         return self.planner_model or self.aider_model
+
+    @property
+    def backend(self) -> str:
+        """The coding backend actually used: anything other than "opencode" means Aider."""
+        return "opencode" if self.coding_backend.strip().lower() == "opencode" else "aider"
+
+    @property
+    def planner_backend_used(self) -> str:
+        """Anything other than "aider" means OpenCode (the default)."""
+        return "aider" if self.planner_backend.strip().lower() == "aider" else "opencode"
+
+    @property
+    def coder_model(self) -> str:
+        return self.opencode_model if self.backend == "opencode" else self.aider_model
+
+    @property
+    def coder_fallback_model(self) -> str:
+        return self.opencode_fallback_model if self.backend == "opencode" else self.aider_fallback_model
 
 
 @lru_cache

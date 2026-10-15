@@ -34,25 +34,37 @@ Describe only what the diff actually does. Do not invent changes, tests or files
 Output only the Markdown, no preamble and no code fence around it."""
 
 
+def takes_temperature(model: str) -> bool:
+    """False for models that should get no temperature at all: current Claude models reject one (400), and for Gemini 3
+    litellm warns that anything below its default 1.0 can cause loops and worse reasoning."""
+    return "claude" not in model and not re.search(r"gemini-3", model)
+
+
 def _complete(model: str, prompt: str) -> tuple[str, dict[str, int]]:
     # litellm is installed with Aider and understands the same model names (e.g. groq/...).
-    from litellm import completion
+    from litellm import completion, completion_cost
 
+    sampling = {"temperature": 0.2} if takes_temperature(model) else {}
     resp = completion(
         model=model,
         messages=[{"role": "user", "content": prompt}],
-        temperature=0.2,
         timeout=90,
+        **sampling,
     )
     u = getattr(resp, "usage", None)
-    usage = {"sent": getattr(u, "prompt_tokens", 0) or 0, "received": getattr(u, "completion_tokens", 0) or 0}
+    usage: dict = {"sent": getattr(u, "prompt_tokens", 0) or 0, "received": getattr(u, "completion_tokens", 0) or 0}
+    try:  # litellm knows list prices for the models it supports; unknown models just have no cost
+        usage["cost"] = float(completion_cost(completion_response=resp))
+    except Exception:
+        usage["cost"] = None
     return resp.choices[0].message.content or "", usage
 
 
-def describe_changes(model: str, issue: JiraIssue, diff: str, usage: dict | None = None) -> str | None:
+def describe_changes(model: str, issue: JiraIssue, diff: str, usage: dict | None = None, fallback: str = "") -> str | None:
     """LLM-written description, or None if the call fails or returns junk.
 
-    If `usage` is given, it's filled with the call's token counts ({"sent", "received"}).
+    `fallback` (a backup model) is tried once when the main model fails or answers in the wrong layout. If `usage` is
+    given, it's filled with the answering call's token counts ({"sent", "received", "cost", "model"}).
     """
     diff = diff.replace("\r", "")
     if len(diff) > MAX_DIFF_CHARS:
@@ -63,16 +75,21 @@ def describe_changes(model: str, issue: JiraIssue, diff: str, usage: dict | None
         description=issue.description or "(no description)",
         diff=diff,
     )
-    try:
-        text, call_usage = _complete(model, prompt)
-        text = text.strip()
-        if usage is not None:
-            usage.update(call_usage)
-    except Exception:
-        log.exception("Could not generate PR description for %s", issue.key)
-        return None
-    text = re.sub(r"^```(?:markdown|md)?\s*\n(.*)\n```$", r"\1", text, flags=re.S).strip()
-    return text if "## Summary" in text else None
+    for m in [model] + ([fallback] if fallback and fallback != model else []):
+        try:
+            text, call_usage = _complete(m, prompt)
+        except Exception:
+            log.warning("Could not generate the PR description for %s with %s", issue.key, m, exc_info=True)
+            continue
+        if usage is not None:  # both calls count when the backup had to answer after an unusable reply
+            cost = None if "cost" in usage and usage["cost"] is None or call_usage.get("cost") is None else usage.get("cost", 0) + call_usage["cost"]
+            usage.update(sent=usage.get("sent", 0) + call_usage.get("sent", 0),
+                         received=usage.get("received", 0) + call_usage.get("received", 0), cost=cost, model=m)
+        text = re.sub(r"^```(?:markdown|md)?\s*\n(.*)\n```$", r"\1", text.strip(), flags=re.S).strip()
+        if "## Summary" in text:
+            return text
+        log.warning("PR description from %s for %s was not in the expected layout", m, issue.key)
+    return None
 
 
 def summary_line(description: str | None) -> str:

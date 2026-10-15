@@ -13,8 +13,14 @@ def no_plan_mode_by_default(monkeypatch):
         "GITHUB_TOKEN": "x", "GITHUB_REPO": "o/r", "WEBHOOK_SECRET": "w",
     }.items():
         monkeypatch.setenv(name, value)
-    for name in ("SLACK_BOT_TOKEN", "SLACK_SIGNING_SECRET", "SLACK_USER_ID", "REDIS_URL", "TICK_TOKEN", "PLANNER_MODEL"):
+    for name in ("SLACK_BOT_TOKEN", "SLACK_SIGNING_SECRET", "SLACK_USER_ID", "REDIS_URL", "TICK_TOKEN", "PLANNER_MODEL",
+                 # model choices from a developer's .env change which retry/fallback path a test takes
+                 "AIDER_FALLBACK_MODEL", "PLANNER_FALLBACK_MODEL", "OPENCODE_FALLBACK_MODEL", "CODING_BACKEND", "MODEL_PRICES",
+                 # a server's public address in .env would switch self-ping on in tests
+                 "SELF_PING_URL", "RENDER_EXTERNAL_URL"):
         monkeypatch.setenv(name, "")
+    # Tests that exercise planning use fake Aider runs unless they ask for OpenCode (the production default).
+    monkeypatch.setenv("PLANNER_BACKEND", "aider")
     from app import config
 
     config.get_settings.cache_clear()

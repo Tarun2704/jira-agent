@@ -73,6 +73,9 @@ class Session:
     last_activity_at: float = field(default_factory=time.time)  # last time the ball changed court
     reminded: bool = False
     result: str = ""  # PR link or the reason it ended
+    # Set each time a run is approved or retried, and stamped into that run's commit ("Agent-Delivery: <id>"): a job
+    # restarted after a crash checks the branch for it, so work that was already pushed is not done a second time.
+    delivery_id: str = ""
 
     def touch(self) -> None:
         self.last_activity_at = time.time()
@@ -206,6 +209,10 @@ class SessionStore:
     def has_lease(self, key: str) -> bool:
         return bool(self.r.exists(self._lease(key)))
 
+    def lease_ttl(self, key: str) -> int:
+        """Seconds until the lease lapses (<= 0 when there is none)."""
+        return max(int(self.r.ttl(self._lease(key))), 0)
+
     # ---- tick lock: only one tick runs at a time, across instances (deploy overlap, local + prod) -------
 
     def acquire_tick_lock(self, owner: str, ttl: int) -> bool:
@@ -264,6 +271,27 @@ class SessionStore:
         pipe.delete(k)
         items, _ = pipe.execute()
         return [json.loads(x) for x in items]
+
+    # ---- Slack messages that couldn't be delivered (Slack down, token revoked...) -----------------------
+
+    def queue_slack(self, msg: dict) -> None:
+        self.r.rpush(f"{PREFIX}slackpending", json.dumps(msg))
+        self.r.expire(f"{PREFIX}slackpending", KEEP_FINISHED_SECONDS)
+
+    def take_slack(self) -> list[dict]:
+        """Remove and return every queued Slack message, oldest first."""
+        k = f"{PREFIX}slackpending"
+        pipe = self.r.pipeline()
+        pipe.lrange(k, 0, -1)
+        pipe.delete(k)
+        items, _ = pipe.execute()
+        return [json.loads(x) for x in items]
+
+    def requeue_slack_first(self, msgs: list[dict]) -> None:
+        """Put messages back at the front (in order), ahead of anything queued meanwhile."""
+        for m in reversed(msgs):
+            self.r.lpush(f"{PREFIX}slackpending", json.dumps(m))
+        self.r.expire(f"{PREFIX}slackpending", KEEP_FINISHED_SECONDS)
 
     # ---- a message waiting for you to say which ticket it is about --------------------------------
 

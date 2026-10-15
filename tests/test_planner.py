@@ -147,7 +147,7 @@ def test_discover_files_uses_the_llm_and_survives_its_failure(tmp_path, monkeypa
     monkeypatch.setattr(planner, "_complete", fake_complete)
     usage = {}
     found = planner.discover_files("m1", ISSUE, "also check the views", tracked, tmp_path, usage)
-    assert found == ["views.py"] and usage == {"sent": 500, "received": 20}
+    assert found == ["views.py"] and usage == {"sent": 500, "received": 20, "model": "m1"}
     model, prompt = prompts[0]
     assert model == "m1" and "auth.py\nviews.py" in prompt or "views.py\nauth.py" in prompt
     assert "also check the views" in prompt and "Fix login" in prompt
@@ -360,3 +360,127 @@ def test_a_failing_fallback_model_is_named_in_the_error(monkeypatch, tmp_path):
     p.s.planner_fallback_model = "gemini/old-model"
     with pytest.raises(AgentError, match="fallback model gemini/old-model was tried"):
         p.run(ISSUE, Session("CA-1"))
+
+
+# ---- PLANNER_BACKEND=opencode ------------------------------------------------------------------------------------------
+
+PLAN_LOG = (
+    "[opencode] model=google/m | model requests=3 | tokens in=900 out=80 | 4.0s | exit=0\n"
+    "[tool] grep login\n[tool] read app/auth/session.py\n[said]\n"
+    "PLAN_START\n## Questions\nNone\n## Plan\n1. Fix the timeout in `app/auth/session.py`.\n## Delete\nNone\n"
+    "## Files\n* `app/auth/session.py`\n## Risks\nNone\nPLAN_END"
+)
+
+
+def _opencode_planner(monkeypatch, tmp_path, output, **settings):
+    from app import planner
+    from app.config import Settings
+    from app.jobs import Job
+
+    seen = {"git": [], "opencode": [], "aider": 0, "discover": 0}
+
+    class FakeAgent:
+        class gh:
+            default_branch = staticmethod(lambda: "main")
+
+        def __init__(self, settings, job): pass
+        def _run(self, cmd, **k):
+            import pathlib
+            pathlib.Path(cmd[-1], ".git", "info").mkdir(parents=True, exist_ok=True)
+            return ""
+        def _git(self, *a, **k):
+            seen["git"].append(a)
+            return "a.py\0app/auth/session.py\0"
+        def _run_aider(self, *a, **k):
+            seen["aider"] += 1
+            return ""
+        def run_opencode_readonly(self, issue, repo_dir, prompt, **k):
+            seen["opencode"].append({"prompt": prompt, **k})
+            return output
+
+    monkeypatch.setattr(planner, "CodingAgent", FakeAgent)
+    monkeypatch.setattr(planner, "discover_files", lambda *a, **k: seen.__setitem__("discover", seen["discover"] + 1) or [])
+    s = Settings(jira_base_url="https://x", jira_email="a", jira_api_token="t", github_token="ghp_TOKEN", github_repo="o/r",
+                 webhook_secret="w", workdir=str(tmp_path), planner_backend="opencode", opencode_model="google/m", **settings)
+    return planner.Planner(s, Job("CA-1", "x")), seen
+
+
+def test_opencode_planner_searches_the_code_itself_and_reads_no_token(monkeypatch, tmp_path):
+    clone = tmp_path / "CA-1-plan"
+    p, seen = _opencode_planner(monkeypatch, tmp_path, PLAN_LOG.replace("`app/auth/session.py`.", f"`{clone}/app/auth/session.py`."))
+    result = p.run(ISSUE, Session("CA-1"))
+    assert result.files == ["app/auth/session.py"] and "session.py" in result.body
+    assert str(clone) not in result.body  # the throwaway clone's absolute path is not part of the plan
+    run = seen["opencode"][0]
+    assert run["model"] == "google/m" and run["max_steps"] == 20 and "PLANNING only" in run["prompt"]
+    assert seen["aider"] == 0 and seen["discover"] == 0  # no Aider call, no guessing files from their paths
+    assert ("remote", "set-url", "origin", "https://github.com/o/r.git") in seen["git"]  # token gone before it runs
+    assert "opencode_plan" in p.job.steps
+
+
+def test_opencode_planner_step_limit_is_explained(monkeypatch, tmp_path):
+    import pytest
+
+    from app.agent import AgentError
+
+    stopped = "[opencode] model=google/m | model requests=20\n[tool] grep x\n[stopped] step limit reached (20 model requests)"
+    p, _ = _opencode_planner(monkeypatch, tmp_path, stopped)
+    with pytest.raises(AgentError, match="OPENCODE_PLAN_MAX_STEPS"):
+        p.run(ISSUE, Session("CA-1"))
+
+
+def test_opencode_planner_falls_back_to_the_opencode_fallback_model(monkeypatch, tmp_path):
+    from app import planner
+
+    monkeypatch.setattr(planner.time, "sleep", lambda s: None)
+    down = "[opencode] model=google/m | model requests=0\n[error] APIError: Rate limit exceeded (HTTP 429)"
+    p, seen = _opencode_planner(monkeypatch, tmp_path, down, opencode_fallback_model="google/backup")
+    outputs = iter([down, PLAN_LOG])
+    p.agent.run_opencode_readonly = lambda issue, repo_dir, prompt, **k: seen["opencode"].append(k) or next(outputs)
+    result = p.run(ISSUE, Session("CA-1"))
+    assert [r["model"] for r in seen["opencode"]] == ["google/m", "google/backup"] and result.body
+    assert any("google/backup" in w for w in result.warnings)
+
+
+def test_aider_planner_also_drops_the_token_from_its_clone(monkeypatch, tmp_path):
+    p = _planner_with_output(monkeypatch, tmp_path, "PLAN_START\n## Plan\n1. x in `a.py`\nPLAN_END")
+    calls = []
+    p.agent._git = lambda *a, **k: calls.append(a) or "a.py\0"
+    p.run(ISSUE, Session("CA-1"))
+    assert ("remote", "set-url", "origin", "https://github.com/o/r.git") in calls
+
+
+def test_a_rejected_request_is_named_and_may_use_the_fallback():
+    from app.agent import llm_problem, retryable_llm_problem
+
+    # 2026-10-14: a broken model-settings file made Google reject every call; it was reported as "no clear plan"
+    out = ("litellm.BadRequestError: GeminiException BadRequestError - {\n  \"error\": {\"code\": 400,\n"
+           "  \"message\": \"Invalid value at 'safety_settings[3].threshold'\",\n  \"status\": \"INVALID_ARGUMENT\"}}\n")
+    p = llm_problem(out)
+    assert p.startswith("The AI provider rejected the request as invalid") and retryable_llm_problem(p)
+    assert retryable_llm_problem(llm_problem("litellm.NotFoundError: model gemini-0 is not found"))
+    blocked = llm_problem("litellm.ContentPolicyViolationError: blocked by the content filter")
+    assert "content filter" in blocked and not retryable_llm_problem(blocked)  # another model won't help with that
+
+
+def test_file_discovery_falls_back_to_the_planner_fallback_model(monkeypatch, tmp_path):
+    """2026-10-14 e2e: with the planner's main model missing, the plan came from the backup model but the file scan
+    before it had no backup ("I couldn't scan the project for related files")."""
+    from app import planner
+
+    (tmp_path / "app.py").write_text("x = 1\n")
+    asked = []
+
+    def complete(model, prompt):
+        asked.append(model)
+        if model == "gemini/missing":
+            raise RuntimeError("litellm.NotFoundError: model gemini/missing is not found")
+        return "app.py", {"sent": 10, "received": 2}
+
+    monkeypatch.setattr(planner, "_complete", complete)
+    usage, warnings = {}, []
+    found = planner.discover_files("gemini/missing", ISSUE, "", ["app.py"], tmp_path, usage, warnings, fallback="gemini/backup")
+    assert found == ["app.py"] and asked == ["gemini/missing", "gemini/backup"] and usage["model"] == "gemini/backup" and not warnings
+    asked.clear()
+    assert planner.discover_files("gemini/missing", ISSUE, "", ["app.py"], tmp_path, {}, warnings) == []  # no backup set
+    assert asked == ["gemini/missing"] and warnings

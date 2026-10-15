@@ -24,7 +24,7 @@ def test_describe_changes_strips_fence_and_crlf(monkeypatch):
     usage = {}
     out = pr_writer.describe_changes("m", ISSUE, "-a\r\n+b\r\n", usage=usage)
     assert out == DESC
-    assert usage == {"sent": 100, "received": 20}
+    assert usage == {"sent": 100, "received": 20, "cost": None, "model": "m"}
     assert "\r" not in seen["prompt"] and "CA-2" in seen["prompt"]
 
 
@@ -37,6 +37,32 @@ def test_describe_changes_returns_none_on_error_or_junk(monkeypatch):
 
     monkeypatch.setattr(pr_writer, "_complete", lambda m, p: ("Sure! Here is a description.", {}))
     assert pr_writer.describe_changes("m", ISSUE, "diff") is None
+
+
+def test_describe_changes_uses_the_backup_model_once(monkeypatch):
+    asked = []
+
+    def flaky(model, prompt):
+        asked.append(model)
+        if model == "main":
+            raise RuntimeError("litellm.RateLimitError: quota")
+        return DESC, {"sent": 50, "received": 10, "cost": 0.001}
+
+    monkeypatch.setattr(pr_writer, "_complete", flaky)
+    usage = {}
+    assert pr_writer.describe_changes("main", ISSUE, "diff", usage=usage, fallback="backup") == DESC
+    assert asked == ["main", "backup"] and usage == {"sent": 50, "received": 10, "cost": 0.001, "model": "backup"}
+
+    # an unusable reply also gets the backup; both calls are counted
+    replies = iter([("Sure! Here you go.", {"sent": 30, "received": 5, "cost": 0.002}), (DESC, {"sent": 50, "received": 10, "cost": 0.001})])
+    monkeypatch.setattr(pr_writer, "_complete", lambda m, p: next(replies))
+    usage = {}
+    assert pr_writer.describe_changes("main", ISSUE, "diff", usage=usage, fallback="backup") == DESC
+    assert (usage["sent"], usage["received"], usage["model"]) == (80, 15, "backup") and abs(usage["cost"] - 0.003) < 1e-9
+
+    asked.clear()
+    monkeypatch.setattr(pr_writer, "_complete", flaky)
+    assert pr_writer.describe_changes("main", ISSUE, "diff") is None and asked == ["main"]  # no backup set: one try
 
 
 def test_summary_line():

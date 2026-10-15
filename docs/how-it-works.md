@@ -103,6 +103,8 @@ Every job starts from a clean clone, so one ticket's leftovers can't leak into t
 ### Step 9: Remember which files use Windows line endings
 `crlf_files()` records files committed with CRLF line endings. Language models write Unix (LF) endings, and without this step a one-line fix shows up on GitHub as the whole file changing.
 
+> **Two coding backends.** Steps 10 and 11 below describe the default, Aider. With `CODING_BACKEND=opencode` those two steps are done by the OpenCode agent instead (it finds files itself, so Step 10 only produces hints, and Step 11 is a sandboxed agent run). The other 17 steps are identical. The OpenCode version of the steps is in [opencode.md §2](opencode.md).
+
 ### Step 10: Pick the files to give Aider
 `mentioned_files()` looks for repo files whose path or file name appears in the ticket's summary or description (e.g. `Crimes in India Dashboard.py`), skipping files over 200 KB such as large CSVs.
 
@@ -110,7 +112,7 @@ Files over 200 KB (data files such as CSVs, large notebooks) are listed in a gen
 
 *Why:* Aider only edits files that have been "added to the chat". Left alone, it didn't reliably add files whose names contain spaces, so the model asked for the file and then gave up. If the ticket names no file, Aider falls back to its **repo map** (a summary of the codebase) to find the right place.
 
-### Step 11: Run Aider
+### Step 11: Run Aider (or OpenCode, see [opencode.md](opencode.md))
 `_run_aider()` runs the `aider` command-line tool once, non-interactively. It sends the model a prompt (`build_task_prompt()`) containing the ticket key, type, title and description, and asks for *"the smallest correct change… follow the existing code style… do not change unrelated code."*
 
 Key options:
@@ -221,6 +223,6 @@ To retry: fix the cause, then remove and re-add the `ai-agent` label.
 | `WEBHOOK_SECRET` | Proving webhooks come from Jira | Compared in constant time; never logged |
 | `JIRA_API_TOKEN` | Reading tickets, posting comments | Sent only to your Jira site |
 | `GITHUB_TOKEN` | Clone, push, PRs | Fine-grained, limited to the target repo; removed from all logs, errors and PR text |
-| `GROQ_API_KEY` | LLM calls | Read by Aider/litellm from the environment |
+| `GROQ_API_KEY` / `GEMINI_API_KEY` | LLM calls | Read by Aider/litellm from the environment. With OpenCode, only the key for the chosen model's provider is handed to the agent; Jira/GitHub/Slack/Redis secrets never are |
 
 All of them are Render environment variables (and `.env` locally, which is gitignored). None are in the code or the repo.

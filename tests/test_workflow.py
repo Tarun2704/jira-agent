@@ -968,6 +968,40 @@ def test_new_review_comments_are_offered_once_and_can_start_a_round(env, monkeyp
     assert "one more nit" in str(env.slack.posts[-1]["blocks"]) and "please rename this" not in str(env.slack.posts[-1]["blocks"])
 
 
+def test_a_round_started_from_a_review_posts_its_plan_in_the_main_chat(env, monkeypatch):
+    """2026-10-15 (CA-22): the owner had last written in the thread under the PR message; the review button then
+    started round 2 and its plan went into that old thread, where nobody looked."""
+    env.plans[:] = [PlanResult("", "## Plan\n1. fix `a.py`", files=["a.py"])]
+    delivered(env, monkeypatch)
+    result_ts = env.slack.posts[-1]["ts"]
+    env.plans.append(PlanResult("", "", reply="You're welcome!", changed=False))
+    env.wf.on_user_message("D1", result_ts, ME, "Thanks for the solution, very helpful", "9.1")  # in the PR message's thread
+    plan_job(env)
+    assert env.store.get("CA-1").reply_to == result_ts
+    env.gh.prs[12] = {"number": 12, "url": PR_URL, "state": "open", "draft": True, "branch": "ai/CA-1-fix"}
+    env.gh.comments[12] = [review("talk:7", "make the count configurable", "")]
+    env.wf.tick()
+    ask = env.slack.posts[-1]
+    button = [b for blk in ask["blocks"] if blk["type"] == "actions" for b in blk["elements"]][0]
+    env.wf.on_action(button["action_id"], "CA-1", ME, "D1", ask["ts"])
+    env.plans.append(PlanResult("", "## Plan\n1. read the count from the command line", files=["a.py"]))
+    plan_job(env)
+    plan_post = [p for p in env.slack.posts if p["text"].startswith("Follow-up plan for CA-1")][-1]
+    assert plan_post["thread_ts"] == ""  # the main chat
+
+
+def test_an_answer_goes_exactly_where_the_owner_wrote(env):
+    env.wf.on_trigger("CA-1")
+    plan_job(env)
+    s = env.store.get("CA-1")
+    assert s.slack_thread_ts  # the plan has a thread...
+    env.wf._say_in(s, "an answer")  # ...but the owner wrote in the main chat (reply_to ""): answer there
+    assert env.slack.posts[-1]["thread_ts"] == ""
+    s.reply_to = "1.99"  # they wrote in a thread: answer in it
+    env.wf._say_in(s, "another answer")
+    assert env.slack.posts[-1]["thread_ts"] == "1.99"
+
+
 def test_ignoring_review_comments_remembers_them(env, monkeypatch):
     env.plans[:] = [PlanResult("", "## Plan\n1. x", files=["a.py"])]
     delivered(env, monkeypatch)

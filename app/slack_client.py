@@ -27,6 +27,7 @@ ACTION_REVIEW_PLAN = "review_plan"  # value KEY: plan changes from the new PR re
 ACTION_REVIEW_IGNORE = "review_ignore"  # value KEY
 ACTION_DESC_PLAN = "desc_plan"  # value KEY: the Jira description changed, plan a follow-up
 ACTION_DESC_IGNORE = "desc_ignore"  # value KEY
+ACTION_RETRY = "retry_round"  # value KEY: run the approved plan again after a failed attempt
 
 
 class SlackError(Exception):
@@ -179,6 +180,11 @@ def confirm_blocks(key: str, title: str, questions_open: bool, note: str = "") -
 
 def superseded_blocks(note: str) -> list[dict]:
     return [{"type": "context", "elements": [{"type": "mrkdwn", "text": note}]}]
+
+
+def retry_blocks(text: str, key: str) -> list[dict]:
+    """A failed run's message, with a button that runs the same approved plan again (no new plan)."""
+    return reply_blocks(text) + [{"type": "actions", "elements": [_button("Retry with the same plan", ACTION_RETRY, key, "primary")]}]
 
 
 def reply_blocks(text: str) -> list[dict]:

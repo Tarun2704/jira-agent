@@ -22,9 +22,10 @@ import uuid
 from contextlib import contextmanager
 
 from app import slack_client as sc
-from app.agent import CodingAgent
+from app.agent import DELIVERY_TRAILER, CodingAgent
+from app.errors import kind_of
 from app.config import Settings
-from app.costs import make_entry, money, parse_prices, summarize
+from app.costs import make_entry, model_prices, money, summarize
 from app.friendly import explain, reference
 from app.github_client import GitHubClient
 from app.jira_client import JiraClient, mention
@@ -42,7 +43,23 @@ PLAN_JOB, EXECUTE_JOB = "plan", "execute"
 # Pure thank-yous to a delivered ticket don't start a new round.
 THANKS = {"thanks", "thank you", "thx", "ty", "ok", "okay", "great", "done", "lgtm", "cool", "nice", "perfect", "got it", "good", "awesome"}
 COMMANDS = {"tickets", "ticket", "open", "list", "status", "help", "/tickets"}
+# "retry", "can u try again", "please run it again with the same plan": nothing but a request to run the approved plan
+# again. Anything else ("try again but use src/") goes to the planner, which may change the plan.
+_RETRY_WORDS = {"retry", "rerun", "re-run", "again", "try"}
+_RETRY_FILLER = {"can", "could", "you", "u", "pls", "plz", "please", "it", "just", "now", "run", "the", "same", "plan",
+                 "with", "code", "changes", "change", "one", "more", "time", "lets", "let's", "ok", "okay", "go", "ahead"}
+
+
+def is_retry_request(text: str) -> bool:
+    words = re.findall(r"[a-z'-]+", text.lower())
+    return bool(words) and set(words) <= _RETRY_WORDS | _RETRY_FILLER and bool(set(words) & {"retry", "rerun", "re-run", "again"})
 _KEY_PREFIX = re.compile(r"^\s*([A-Za-z][A-Za-z0-9]*-\d+)\b\s*[:,\-\u2013\u2014]?\s*(.*)$", re.S)
+
+
+def _run_later(delay: float, fn) -> None:
+    t = threading.Timer(delay, fn)
+    t.daemon = True
+    t.start()
 
 
 def _age(seconds: float) -> str:
@@ -67,6 +84,7 @@ class Workflow:
         self._jira = jira_factory or (lambda: JiraClient(settings))
         self._github = github_factory or (lambda: GitHubClient(settings))
         self._sleep = time.sleep  # (tests replace it)
+        self._later = _run_later  # (tests replace it)
         self.deferred_triggers: set[str] = set()  # tickets whose start failed (Redis down); retried on the next tick
         self._tick_guard = threading.Lock()  # one tick at a time in this process (the Redis lock covers other instances)
 
@@ -87,8 +105,9 @@ class Workflow:
             return text
         return f"*{key}* · {text}"
 
-    def _post_reliably(self, channel: str, text: str, blocks: list | None = None, thread_ts: str = "") -> dict | None:
-        """Post to Slack: three tries with a short wait, then once as plain text. None if all fail."""
+    def _post_reliably(self, channel: str, text: str, blocks: list | None = None, thread_ts: str = "", key: str = "") -> dict | None:
+        """Post to Slack: three tries with a short wait, then once as plain text. None if all fail; the message is
+        then kept in Redis and sent by the watchdog (or /tick) once Slack answers again."""
         for delay in (0, 0.5, 1.5):
             if delay:
                 self._sleep(delay)
@@ -101,7 +120,59 @@ class Workflow:
                 return self.slack.post(text, channel=channel, thread_ts=thread_ts)
             except Exception:
                 log.warning("Slack post failed even as plain text", exc_info=True)
+        if channel:
+            try:
+                self.store.queue_slack({"channel": channel, "text": text, "blocks": blocks, "thread_ts": thread_ts,
+                                        "key": key, "at": time.time(), "tries": 0})
+                log.warning("Slack unreachable: message queued for later")
+            except Exception:
+                log.warning("Could not queue the Slack message either; it is lost", exc_info=True)
         return None
+
+    def flush_slack(self) -> int:
+        """Send queued Slack messages, oldest first, each marked as delayed. Stops at the first failure (Slack is
+        still down) and keeps the rest for next time. Returns how many were sent."""
+        try:
+            pending = self.store.take_slack()
+        except Exception:
+            log.warning("Could not read the queued Slack messages", exc_info=True)
+            return 0
+        sent = 0
+        for i, m in enumerate(pending):
+            note = f":hourglass: _Delayed: Slack couldn't be reached at {time.strftime('%H:%M UTC', time.gmtime(m['at']))}._"
+            blocks = [{"type": "context", "elements": [{"type": "mrkdwn", "text": note}]}, *m["blocks"]] if m.get("blocks") else None
+            try:
+                ref = self.slack.post(m["text"] if blocks else f"{note}\n{m['text']}", channel=m["channel"], blocks=blocks, thread_ts=m.get("thread_ts", ""))
+            except Exception:
+                rest = [dict(m, tries=m.get("tries", 0) + 1)] + pending[i + 1:]
+                if rest[0]["tries"] >= 60:  # about an hour of watchdog runs
+                    log.error("Giving up on a queued Slack message for %s after %s tries", m.get("key"), rest[0]["tries"])
+                    rest = rest[1:]
+                try:
+                    self.store.requeue_slack_first(rest)
+                except Exception:
+                    log.warning("Could not re-queue %d Slack message(s); they are lost", len(rest), exc_info=True)
+                break
+            sent += 1
+            if m.get("key") and ref:  # replies under the delayed message still find their ticket
+                self.store.map_thread(ref["channel"], ref["ts"], m["key"])
+        return sent
+
+    def requeue_orphans(self) -> list[str]:
+        """Tickets in a running state whose job no longer holds the lease (the process died): queue the job again."""
+        requeued = []
+        for key in self.store.active_keys():
+            s = self.store.get(key)
+            if s and s.status in RUNNING and not self.store.has_lease(key):
+                log.warning("Session %s is %s but no job holds its lease; re-queuing", key, s.status)
+                self.submit(EXECUTE_JOB if s.status == EXECUTING else PLAN_JOB, key)
+                requeued.append(key)
+        return requeued
+
+    def watchdog(self) -> dict:
+        """Run by the app every WATCHDOG_SECONDS: a crashed job restarts within about LEASE_SECONDS, without waiting
+        for /tick, and Slack messages held back by an outage are sent. Reminders and PR checks stay with /tick."""
+        return {"requeued": self.requeue_orphans(), "slack_sent": self.flush_slack()}
 
     def _say(self, s: Session, text: str, blocks: list | None = None, important: bool = False, thread_ts: str = "") -> dict | None:
         """Post a new message in the main DM chat (never hidden in a thread unless `thread_ts` says so). Never raises.
@@ -110,7 +181,7 @@ class Workflow:
         ticket instead, so the outcome isn't lost.
         """
         text = self._tag(s.issue_key, text)
-        ref = self._post_reliably(s.slack_channel, text, blocks, thread_ts=thread_ts)
+        ref = self._post_reliably(s.slack_channel, text, blocks, thread_ts=thread_ts, key=s.issue_key)
         if ref is None and important:
             self._jira_comment(s.issue_key, "🤖 (I couldn't reach Slack, so this is posted here instead)\n" + re.sub(r"[`*]", "", text))
         return ref
@@ -134,7 +205,7 @@ class Workflow:
             return
         try:
             cur = self.store.get(job.issue_key)  # re-read: planning may just have started a new round
-            entry = make_entry(job.id, kind, cur.round_no if cur else 0, job.calls, parse_prices(self.s.model_prices))
+            entry = make_entry(job.id, kind, cur.round_no if cur else 0, job.calls, model_prices(self.s.model_prices))
             self.store.append_cost(job.issue_key, entry)
         except Exception:
             log.warning("Could not save the cost record for %s", job.issue_key, exc_info=True)
@@ -172,6 +243,46 @@ class Workflow:
                 s = self.store.get(key) if self.store else None
                 if s and s.slack_channel:
                     self._post_reliably(s.slack_channel, f":warning: *{key}*: couldn't comment on the Jira ticket. I'll retry shortly.")
+
+    def _already_shipped(self, s: Session, st: dict) -> dict | None:
+        """The delivery of this run if its commit is already on GitHub with an open PR (the job was cut off after the
+        push), else None. Any doubt (no stamp, GitHub unreachable) means None: the run then goes ahead as usual."""
+        if not s.delivery_id:
+            return None
+        try:
+            gh = self._github()
+            if st["mode"] == "continue":
+                pr = {"number": st["pr_number"], "url": st["pr_url"], "branch": st["branch"]}
+            elif st["mode"] == "fresh":
+                pr = gh.open_pr_for_branch(st["branch"])
+            else:
+                url = gh.find_open_pr_for_issue(s.issue_key)
+                pr = gh.get_pr(gh.pr_number(url)) if url else None
+                pr = pr and {"number": pr["number"], "url": pr["url"], "branch": pr["branch"]}
+            if not pr:
+                return None
+            message = gh.branch_head_message(pr["branch"]) or ""
+        except Exception:
+            log.warning("Could not check whether %s was already pushed; running it", s.issue_key, exc_info=True)
+            return None
+        if f"{DELIVERY_TRAILER}{s.delivery_id}" not in message:
+            return None
+        return {"branch": pr["branch"], "pr_number": pr["number"], "pr_url": pr["url"], "diff": "",
+                "summary": message.split("\n", 1)[0].split(": ", 1)[-1][:300], "deleted": list(s.delete_files)}
+
+    def _retry_when_lease_lapses(self, kind: str, key: str) -> None:
+        """A job that found the ticket's lease taken tries again once that lease would have lapsed.
+
+        The holder may be a process that died with it (a deploy, a crash, a restart while the result was still being
+        posted). Without this, the ticket waited for the next /tick (~10 minutes; never without a pinger) while the
+        owner's message sat on "Looking into it...". If the holder is alive and still working, the retry finds the
+        lease refreshed and schedules itself again, until the session no longer needs this job."""
+        def again():
+            s = self.store.get(key)
+            if s and (s.status == EXECUTING if kind == EXECUTE_JOB else s.status in (PLANNING, REVISING)):
+                self.submit(kind, key)
+
+        self._later(self.store.lease_ttl(key) + 2, again)
 
     @contextmanager
     def leased(self, key: str):
@@ -266,8 +377,9 @@ class Workflow:
         key = job.issue_key
         with self.leased(key) as ok:
             if not ok:
-                log.info("Plan job for %s skipped: another worker holds the lease", key)
+                log.info("Plan job for %s skipped: another worker holds the lease; trying again when it lapses", key)
                 job.finish("skipped", "lease held elsewhere")
+                self._retry_when_lease_lapses(PLAN_JOB, key)
                 return
             s = self.store.get(key)
             if not s or s.status not in (PLANNING, REVISING):
@@ -278,9 +390,13 @@ class Workflow:
                 outcome = self._plan(job, s)
                 job.finish("succeeded" if outcome == "posted" else "skipped", outcome)
             except Exception as e:
-                log.exception("Planning failed for %s", key)
-                self._plan_failed(s, self._scrub(str(e)), job.id)
-                job.finish("failed", self._scrub(str(e))[-500:])
+                error = self._scrub(str(e))
+                kind = kind_of(error, getattr(e, "code", None))
+                log.exception("Planning failed for %s (%s)", key, kind.code)
+                if kind.admin:
+                    log.error("ADMIN: %s needs fixing [%s]: %s", key, kind.code, error[:300])
+                self._plan_failed(s, error, job.id, kind.code)
+                job.finish("failed", error[-500:], code=kind.code)
             finally:
                 self._save_runs(job, "plan")
                 self._save_cost(job, "plan")
@@ -323,6 +439,7 @@ class Workflow:
 
         first = not s.slack_thread_ts
         handled = {"n": 0}
+        before = s.handled_upto
 
         def mark(x: Session):
             handled["n"] = len(x.messages)
@@ -398,7 +515,9 @@ class Workflow:
                 said += f" The follow-up plan (round {round_no}) is below."
             elif not first:
                 said += f" The updated plan (v{version}) is below."
-            self._answer(s, handled["n"], said)
+            if result.reply or not first or handled["n"] > before:
+                self._answer(s, handled["n"], said)
+            # (else: a brand-new ticket's first plan, with nothing you wrote to answer: the plan says it all)
             warn()
 
         def finish(x: Session):
@@ -461,12 +580,12 @@ class Workflow:
         except Exception:
             log.warning("Could not mark old plan message superseded for %s", s.issue_key, exc_info=True)
 
-    def _plan_failed(self, s: Session, error: str, job_id: str = "") -> None:
+    def _plan_failed(self, s: Session, error: str, job_id: str = "", code: str | None = None) -> None:
         key = s.issue_key
         fresh = self.store.get(key) or s
         again = "Ask again to retry." if fresh.followup else "Reply here to try again."
         # an error answers what you just wrote: in the thread if you wrote in a thread, in the main chat if you wrote there
-        ref = self._say(fresh, f":x: I couldn't produce the plan for {key}. {explain(error)}\n{again}{reference(job_id)}", important=True, thread_ts=fresh.reply_to)
+        ref = self._say(fresh, f":x: I couldn't produce the plan for {key}. {explain(error, code)}\n{again}{reference(job_id)}", important=True, thread_ts=fresh.reply_to)
         thread = fresh.slack_thread_ts or (ref or {}).get("ts", "")
         channel = fresh.slack_channel or (ref or {}).get("channel", "")
         if ref and not fresh.slack_thread_ts:
@@ -491,7 +610,7 @@ class Workflow:
             x.touch()
 
         self.store.update(key, fail)
-        self._jira_comment(key, f"🤖 I couldn't produce the plan. {explain(error)}{reference(job_id).replace('_', '')}")
+        self._jira_comment(key, f"🤖 I couldn't produce the plan. {explain(error, code)}{reference(job_id).replace('_', '')}")
 
     def resume_if_needed(self, key: str) -> None:
         """After a plan job: if you wrote again while it ran, plan again."""
@@ -559,6 +678,8 @@ class Workflow:
         if before and before.status == DELIVERED and text.lower().strip(" .!") in THANKS:
             self._reply_loose(channel, thread_ts, "\U0001F44D")
             return "thanks"
+        if before and self._can_retry(before) and is_retry_request(text):
+            return self._retry_failed_round(key, channel, "", said=text, thread_ts=thread_ts)
         # Where the answer goes: like a normal chat. A message in the main DM is answered in the
         # main DM; a message inside a thread is answered in that thread.
         anchor = thread_ts
@@ -609,6 +730,38 @@ class Workflow:
         self.submit(PLAN_JOB, key)  # a no-op while a plan job is in flight; resume_if_needed catches it
         return result
 
+    @staticmethod
+    def _can_retry(s: Session) -> bool:
+        return s.status == DELIVERED and bool(s.plan) and bool(s.rounds) and s.rounds[-1].get("outcome") == "failed"
+
+    def _retry_failed_round(self, key: str, channel: str, message_ts: str, said: str = "", thread_ts: str = "") -> str:
+        """Run the approved plan of a failed round again: no new plan, no new approval (it was approved already).
+
+        The failed attempt is taken off the round list (its runs and costs stay saved), so the retry delivers exactly
+        as the first attempt would have: same round number, same branch and PR rules."""
+        def apply(x: Session):
+            if not self._can_retry(x):
+                return False
+            x.rounds.pop()
+            x.delivery_id = uuid.uuid4().hex[:12]
+            if said:
+                x.add_message("user", said)
+                x.handled_upto = len(x.messages)
+            x.status, x.followup, x.force_plan, x.result = EXECUTING, False, False, ""
+            x.touch()
+
+        before = self.store.get(key)
+        s = self.store.update(key, apply)
+        if not s or s.status != EXECUTING or not before or before.status == EXECUTING:
+            self._reply_loose(channel, thread_ts, f"*{key}* has no failed run to retry right now.")
+            return "ignored_retry"
+        if message_ts:  # the button: it can't be pressed twice
+            self._update(channel, message_ts, "Retrying.", f":repeat: _Retrying *{key}* with the approved plan..._")
+        self._say(s, f":repeat: *Retrying {key}* with the approved plan (v{s.plan_version}). I'll post the result here.")
+        self._jira_comment(key, "🤖 Retrying the approved plan after the previous attempt failed.")
+        self.submit(EXECUTE_JOB, key)
+        return "retrying"
+
     def _completed_text(self, s: Session) -> str:
         return (
             f":white_check_mark: *{s.issue_key}* is completed ({s.result or s.status}). To change something, create a new Jira ticket, "
@@ -649,6 +802,9 @@ class Workflow:
         if not s:
             return "no_session"
 
+        if action_id == sc.ACTION_RETRY:
+            return self._retry_failed_round(key, channel, message_ts)
+
         if action_id == sc.ACTION_PROCEED:
             if not s.plan:
                 return "no_plan"
@@ -677,7 +833,7 @@ class Workflow:
             return "back"
 
         if action_id == sc.ACTION_CONFIRM:
-            moved = self.store.transition(key, CONFIRMING, EXECUTING)
+            moved = self.store.transition(key, CONFIRMING, EXECUTING, delivery_id=uuid.uuid4().hex[:12])
             if not moved:
                 return f"ignored:{s.status}"
             self._lock_plan_message(moved, message_ts)
@@ -812,7 +968,9 @@ class Workflow:
         key = job.issue_key
         with self.leased(key) as ok:
             if not ok:
+                log.info("Execute job for %s skipped: another worker holds the lease; trying again when it lapses", key)
                 job.finish("skipped", "lease held elsewhere")
+                self._retry_when_lease_lapses(EXECUTE_JOB, key)
                 return
             s = self.store.get(key)
             if not s or s.status != EXECUTING:
@@ -832,9 +990,18 @@ class Workflow:
                 job.finish("failed", "Couldn't check the pull request's state. Nothing was changed.")
                 self._finish_execution(s, job)
                 return
+            shipped = self._already_shipped(s, st)
+            if shipped:  # a restart cut the job off after its push: record what is on GitHub, don't do it again
+                log.warning("%s: this run's commit is already on %s; recording it instead of coding again", key, shipped["branch"])
+                job.delivery, job.pr_url = shipped, shipped["pr_url"]
+                job.warnings.append("I was restarted while finishing this; the work had already been pushed, so it wasn't redone.")
+                job.finish("succeeded")
+                self._finish_execution(s, job)
+                return
             # handle_issue never raises: it records the outcome on the job and comments on the ticket.
             try:
-                CodingAgent(self.s, job, plan=approved_plan_text(s), plan_files=s.files, followup=followup, deletions=s.delete_files).handle_issue(key)
+                CodingAgent(self.s, job, plan=approved_plan_text(s), plan_files=s.files, followup=followup,
+                            deletions=s.delete_files, delivery_id=s.delivery_id).handle_issue(key)
             finally:
                 self._save_runs(job, "execute")
                 self._save_cost(job, "execute")
@@ -863,6 +1030,7 @@ class Workflow:
             "n": s.round_no, "request": s.round_request or s.title, "plan": s.plan, "files": s.files,
             "deleted": d.get("deleted", []),
             "summary": d.get("summary") or self._gist(s.plan), "outcome": outcome, "detail": (job.detail or "")[:500],
+            "code": getattr(job, "error_code", None) if job.status == "failed" else None,
             "pr_url": d.get("pr_url", ""), "pr_number": d.get("pr_number", 0), "branch": d.get("branch", ""),
             "diff": d.get("diff", ""), "source": s.round_source, "finished_at": time.time(),
         }
@@ -902,7 +1070,12 @@ class Workflow:
             msg = (f":thinking_face: *{key}*: I looked at the code and didn't change anything. Here is what I found:\n{said}\n"
                    "Reply here with what to do differently (naming the files helps) and I'll plan again.")
         else:
-            msg = f":x: *{key}*: I couldn't finish this. {explain(job.detail or '')}\nReply here to try again.{reference(job.id)}"
+            kind = kind_of(job.detail, getattr(job, "error_code", None))
+            again = ("Press *Retry* (or reply `retry`) to run the same approved plan again, or reply with what to change and I'll plan again."
+                     if kind.retry else
+                     "Once the admin has fixed this, reply `retry` to run the same approved plan again, or reply with what to change and I'll plan again."
+                     if kind.admin else "Reply with what to change and I'll plan again.")
+            msg = f":x: *{key}*: I couldn't finish this. {explain(job.detail or '', kind.code)}\n{again}{reference(job.id)}"
         for w in job.warnings:
             msg += f"\n:warning: {w}"
         if job.status != "skipped":
@@ -910,7 +1083,9 @@ class Workflow:
             if cost:
                 msg += f"\n{cost}"
         fresh = self.store.get(key) or s
-        ref = self._say(fresh, self._scrub(msg), important=True)
+        text = self._scrub(msg)
+        retry = job.status == "failed" and bool(fresh.plan) and kind_of(job.detail, getattr(job, "error_code", None)).retry
+        ref = self._say(fresh, text, sc.retry_blocks(self._tag(key, text), key) if retry else None, important=True)
         if ref:  # replies under the result message belong to this ticket
             self.store.map_thread(ref["channel"], ref["ts"], key)
 
@@ -950,6 +1125,7 @@ class Workflow:
                 log.warning("Retrying the start of %s failed again", key, exc_info=True)
                 self.deferred_triggers.add(key)
         self._flush_jira_comments()
+        out["slack_sent"] = self.flush_slack()
         for key in self.store.active_keys():
             s = self.store.get(key)
             if not s or s.status in TERMINAL:
@@ -1018,6 +1194,7 @@ class Workflow:
             if self.store.transition(key, DELIVERED, DONE, result=f"PR #{pr['number']} merged"):
                 self._say(s, f":tada: *{key}*: PR #{pr['number']} was merged. The ticket is completed. For more changes, create a new Jira ticket (or update this one and add the `{self.s.trigger_label}` label again).")
                 self._jira_comment(key, f"🤖 PR #{pr['number']} was merged. Marking this ticket completed.")
+                self._move_jira(key, self.s.jira_status_done)
                 return "merged"
             return ""
         if pr["state"] == "closed":
@@ -1046,6 +1223,17 @@ class Workflow:
         ))
         self._say(s, f"New review on PR #{pr['number']} for {key}.", sc.review_blocks(key, pr["number"], pr["url"], new))
         return "reviews"
+
+    def _move_jira(self, key: str, status: str) -> None:
+        """Move the ticket to `status` if the project's workflow allows it from where it is. Never raises."""
+        if not status:
+            return
+        try:
+            outcome = self._jira().transition_to(key, status)
+            if outcome == "unavailable":
+                log.warning("%s: no Jira transition to %r from its current status; left as it is", key, status)
+        except Exception:
+            log.warning("Could not move %s to %r in Jira", key, status, exc_info=True)
 
     def _remind(self, s: Session) -> None:
         hours = self.s.plan_reminder_hours

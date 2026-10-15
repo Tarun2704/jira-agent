@@ -2,11 +2,11 @@
 
 [![Tests](https://github.com/Tarun2704/jira-agent/actions/workflows/tests.yml/badge.svg)](https://github.com/Tarun2704/jira-agent/actions/workflows/tests.yml)
 
-Create a Jira ticket with the label `ai-agent` and this service fixes it: it clones the repo, has an LLM (via [Aider](https://aider.chat)) make the change, pushes a branch, opens a pull request with a written description, and comments the PR link back on the ticket. Everything runs on free tiers (Jira Free, GitHub Free, Render Free, Groq).
+Create a Jira ticket with the label `ai-agent` and this service fixes it: it clones the repo, has an LLM coding tool make the change ([Aider](https://aider.chat) by default, or the [OpenCode](https://opencode.ai) agent: a switch in the environment), pushes a branch, opens a pull request with a written description, and comments the PR link back on the ticket. Everything runs on free tiers (Jira Free, GitHub Free, Render Free, Groq).
 
 **Understand the design:** [docs/design-and-scenarios.md](docs/design-and-scenarios.md) explains the full flow, what happens in every scenario, the alternatives considered, and why Aider was used instead of building a custom AI coding agent.
 
-For a step-by-step explanation of what happens during a run, see [docs/how-it-works.md](docs/how-it-works.md).
+For a step-by-step explanation of what happens during a run, see [docs/how-it-works.md](docs/how-it-works.md). To compare Aider with the OpenCode agent on the same ticket, see [docs/opencode.md](docs/opencode.md).
 Setting up on another computer: [docs/setup-new-machine.md](docs/setup-new-machine.md).
 
 ```
@@ -16,7 +16,10 @@ Jira ticket (label ai-agent)
 POST /jira-webhook ──queue──▶ CodingAgent
                               ├─ fetch ticket (Jira REST)              → comment "picked this up"
                               ├─ git clone, branch ai/KEY-title
-                              ├─ aider: edit files named in the ticket (diff mode, no shell commands)
+                              ├─ coding tool edits the files (CODING_BACKEND):
+                              │    aider    - edit the files named in the ticket (diff mode, no shell commands)
+                              │    opencode - an agent explores the repo and edits (no shell by default)
+                              │    (either way the tool only edits files: this app does every commit and push)
                               ├─ restore original line endings
                               ├─ syntax-check changed files (one automatic fix attempt on errors)
                               ├─ LLM writes PR description from the real diff
@@ -55,7 +58,8 @@ While it works, the agent moves the ticket **To Do → In Progress → In Review
 | Path | Purpose |
 |---|---|
 | `app/main.py` | FastAPI app: webhook signature check, trigger rules, dedupe, single-worker queue |
-| `app/agent.py` | The job: clone → Aider → commit → push → PR → Jira comments |
+| `app/agent.py` | The job: clone → coding tool (Aider or OpenCode) → commit → push → PR → Jira comments |
+| `app/opencode_runner.py` | The OpenCode backend: config, scrubbed environment, process control, event parsing |
 | `app/checks.py` | Checks run before the PR (Python syntax), shown as a **Checks** section in the PR |
 | `app/pr_writer.py` | LLM-written PR description (Summary / Changes / How to verify) with a plain fallback |
 | `app/jira_client.py` | Get ticket, add comment |
@@ -63,10 +67,15 @@ While it works, the agent moves the ticket **To Do → In Progress → In Review
 | `app/jobs.py` | Observability: job history for `/jobs`, step timings, token counts, job-tagged logs |
 | `app/config.py` | Settings from environment variables |
 | `scripts/check_setup.py` | Verify Jira, GitHub and Groq credentials and model (read-only, prints no secrets) |
+| `scripts/check_opencode.py` | Smoke-test the OpenCode backend with your real model and key (a few cents, no Jira/GitHub) |
 | `scripts/send_test_webhook.py` | Send a signed, Jira-shaped webhook for a ticket |
 | `docs/how-it-works.md` | The flow step by step: what each step does and why |
 | `docs/observability.md` | Logs and `/jobs`: where to look and what each line means |
+| `docs/opencode.md` | The OpenCode backend: how a run works, safety, costs, Render sizing, troubleshooting |
 | `docs/known-issues.md` | Limitations, past fixes, troubleshooting |
+| `docs/planner-comparison.md` | Aider vs OpenCode as the planner, measured on a small and a big repo; which to pick |
+| `docs/e2e-test-report.md` | End-to-end run of both backends with an injected fault at every stage: what happened, what was fixed |
+| `docs/todo.md` | Open follow-ups: what to do before the next deploy, known gaps, next improvements |
 | `docs/setup-new-machine.md` | Step-by-step setup on another laptop |
 | `docs/design-and-scenarios.md` | Full flow, behaviour in every scenario, options considered, and why Aider |
 | `docs/operations.md` | Runbook: run a ticket, run it again, fix a stuck ticket, clean up after tests or a demo |
@@ -85,11 +94,15 @@ Copy `.env.example` to `.env` and fill it in. `.env` is gitignored; never commit
 | `GROQ_API_KEY` | Groq API key (or another provider's key, matching `AIDER_MODEL`) |
 | `AIDER_MODEL` | e.g. `groq/openai/gpt-oss-120b`. Also used to write PR descriptions. |
 | `AIDER_EDIT_FORMAT` | `diff` (default, edits only needed lines) or `whole` |
+| `CODING_BACKEND` | `aider` (default) or `opencode`: who edits the files. Planning, PR text, git, Jira and Slack don't change. See [docs/opencode.md](docs/opencode.md) |
+| `PLANNER_BACKEND` | `opencode` (default) or `aider`: who reads the code and writes the plan (independent of `CODING_BACKEND`). OpenCode searches file contents: right on big repos, ~3× the requests; Aider is cheaper on small repos. See [docs/planner-comparison.md](docs/planner-comparison.md) |
+| `OPENCODE_MODEL` | Default `google/gemini-2.5-flash` (`provider/model`; uses your `GEMINI_API_KEY`). Only used with `CODING_BACKEND=opencode` |
+| `OPENCODE_FALLBACK_MODEL`, `OPENCODE_MAX_STEPS`, `OPENCODE_TIMEOUT_SECONDS`, `OPENCODE_ALLOW_BASH`, `OPENCODE_VARIANT`, `OPENCODE_PASS_ENV`, `OPENCODE_EXTRA_CONFIG`, `OPENCODE_BIN` | OpenCode tuning: see [docs/opencode.md §3](docs/opencode.md) (shell access is **off** by default) |
 | `WEBHOOK_SECRET` | Random string; must match the Secret in the Jira webhook |
 | `TRIGGER_LABEL` | Default `ai-agent` |
 | `QUEUE_LABEL` | Default `ai-agent-queued`; marks queued/running tickets so they survive restarts (empty = off) |
 | `RECOVERY_DELAY_SECONDS` | Default `120`; wait after startup before resuming queued tickets |
-| `JIRA_STATUS_IN_PROGRESS` / `JIRA_STATUS_IN_REVIEW` / `JIRA_STATUS_ON_FAILURE` | Defaults `In Progress` / `In Review` / `To Do` (empty = don't move) |
+| `JIRA_STATUS_IN_PROGRESS` / `JIRA_STATUS_IN_REVIEW` / `JIRA_STATUS_ON_FAILURE` / `JIRA_STATUS_DONE` | Defaults `In Progress` / `In Review` / `To Do` / `Done` (PR merged); empty = don't move |
 | `OPEN_DRAFT_PR` | Default `true` |
 
 Check everything with:
@@ -125,6 +138,8 @@ Tests (no credentials needed): `.venv/bin/python -m pytest -q`. They also run on
 5. Deploy. Every push to `main` redeploys automatically.
 
 Current deployment: `https://jira-agent-r9w8.onrender.com`
+
+> **OpenCode needs more memory than the Free plan has.** One run peaks near 550 MB; the Free instance has 512 MB. Keep `CODING_BACKEND=aider` on Free, or move to an instance with 1 GB+ (2 GB is comfortable) to use OpenCode. `/health` shows a warning under `problems` if the container is too small. To make Render deploy only after the tests pass, use its "deploy after CI checks pass" auto-deploy option; the tests run in GitHub Actions. Details: [docs/opencode.md §6](docs/opencode.md).
 
 ## Connect Jira
 

@@ -135,12 +135,29 @@ def _startup_tick() -> None:
         log.warning("Startup tick failed", exc_info=True)
 
 
+_watchdog_stop = threading.Event()
+
+
+def _watchdog_loop(every: int) -> None:
+    """Re-queue crashed jobs and re-send held-back Slack messages, independently of /tick (see Workflow.watchdog)."""
+    while not _watchdog_stop.wait(every):
+        try:
+            out = _workflow().watchdog()
+            if out["requeued"] or out["slack_sent"]:
+                log.info("Watchdog: %s", out)
+        except Exception:
+            log.warning("Watchdog run failed", exc_info=True)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     if get_settings().planning_enabled:
         # Leases make a delay unnecessary: a job still running on the old instance keeps its
         # lease alive, so only genuinely orphaned sessions get re-queued.
         threading.Thread(target=_startup_tick, name="startup-tick", daemon=True).start()
+        if get_settings().watchdog_seconds > 0:
+            _watchdog_stop.clear()
+            threading.Thread(target=_watchdog_loop, args=(get_settings().watchdog_seconds,), name="watchdog", daemon=True).start()
     else:
         threading.Thread(target=_startup_checks, name="startup-checks", daemon=True).start()
         threading.Thread(target=_recover_after_delay, name="recover-queued", daemon=True).start()
@@ -155,6 +172,7 @@ async def lifespan(app: FastAPI):
     elif get_settings().planning_enabled:
         log.info("Self-ping is OFF (no public URL: RENDER_EXTERNAL_URL / SELF_PING_URL, or disabled). Use an outside pinger for /tick.")
     yield
+    _watchdog_stop.set()
     if pinger:
         pinger.stop()
 

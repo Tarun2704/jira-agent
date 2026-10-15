@@ -39,6 +39,12 @@ The ticket goes To Do → In Progress → In Review again, and a new PR appears.
 
 ---
 
+### Compare Aider and OpenCode on the same ticket
+
+Set `CODING_BACKEND=aider` on Render, run the ticket, close its PR (above), set `CODING_BACKEND=opencode`, redeploy, and re-add the label. Then compare the two PRs and the cost records at `/usage/CA-5?token=<WEBHOOK_SECRET>` (requests, tokens, cost). OpenCode needs a Render instance with 1 GB+ of memory. Full procedure and how to read the numbers: [opencode.md §1](opencode.md).
+
+---
+
 ## 3. Fix a stuck ticket
 
 | Symptom | Cause | Fix |
@@ -48,6 +54,7 @@ The ticket goes To Do → In Progress → In Review again, and a new PR appears.
 | No agent comment at all after a few minutes | The webhook never arrived (e.g. sent during a deploy) | Remove and re-add `ai-agent`, or replay it (section 5). |
 | Comment "made no changes" | Ticket too vague, or too big for the free AI tier | Make it more specific or smaller, then rerun (section 2). |
 | Comment "Skipped: a pull request … is already open" | A PR already exists for this ticket | Close it first (section 2, step 1). |
+| Job failed with an OpenCode message (not installed, out of memory, rate limit, step limit...) | See the table in [opencode.md §7](opencode.md) | Follow the fix there, or set `CODING_BACKEND=aider` to carry on meanwhile. |
 
 ---
 

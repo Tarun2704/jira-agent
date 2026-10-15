@@ -6,14 +6,16 @@ import subprocess
 import time
 from pathlib import Path
 
+from app.errors import kind_of, reason
 from app.friendly import explain
 from app.checks import CheckResult, format_checks_md, python_syntax_check
 from app.config import Settings
 from app.github_client import GitHubClient
 from app.jira_client import JiraClient, JiraIssue
-from app.jobs import Job, parse_aider_tokens
+from app.jobs import Job
+from app import opencode_runner as oc
 from app.retry import is_transient_git_error, wait_for
-from app.pr_writer import build_pr_body, describe_changes, summary_line
+from app.pr_writer import build_pr_body, describe_changes, summary_line, takes_temperature
 
 log = logging.getLogger(__name__)
 
@@ -22,19 +24,18 @@ log = logging.getLogger(__name__)
 # Aider prints LLM provider failures into its output instead of failing loudly. These are recognised
 # only at the points where the run produced nothing useful (no plan, no changes), because Aider also
 # prints transient errors that it then retries successfully.
+# (pattern in the provider's output, error kind): the kind's `reason` in app/errors.py is the sentence reported.
 _LLM_PROBLEMS = [
     (r"ContextWindowExceeded|estimated chat context|exceeds the [\d,]+ token|context (length|window)|request too large|reduce the length|exceeds the (maximum|limit)|too many tokens|token limit",
-     "The request was too large for the model (token/context limit). Use a smaller ticket or fewer files, or a model with a bigger limit."),
-    (r"RateLimitError|rate.?limit|tokens per (minute|day)|\bTPM\b|\bTPD\b|quota|insufficient_quota|429",
-     "The LLM provider's rate or usage limit was hit. Wait a bit and reply to try again."),
-    (r"ContentPolicyViolation|content[_ ]filter|content management policy|safety|blocked|moderation",
-     "The model refused or blocked the request (content filter)."),
-    (r"AuthenticationError|invalid api key|incorrect api key|unauthorized|\b401\b|PermissionDenied|\b403\b",
-     "The LLM API key was rejected. Check the key and the model name."),
-    (r"NotFoundError|model.*not (found|exist)|does not exist|decommissioned|\b404\b",
-     "The model name wasn't found at the provider. Check AIDER_MODEL / PLANNER_MODEL."),
-    (r"APIConnectionError|ServiceUnavailable|InternalServerError|overloaded|\b50[0-4]\b|timed? ?out|Timeout|APIError",
-     "The LLM provider was unavailable or timed out. Try again in a minute."),
+     "too_large"),
+    (r"RateLimitError|rate.?limit|tokens per (minute|day)|\bTPM\b|\bTPD\b|quota|insufficient_quota|429", "rate_limit"),
+    (r"ContentPolicyViolation|content[_ ]filter|content management policy|safety(?!_settings)|blocked|moderation", "content_blocked"),
+    (r"AuthenticationError|invalid api key|incorrect api key|unauthorized|\b401\b|PermissionDenied|\b403\b", "auth"),
+    # a 400 that isn't about size or content: the provider refused a setting or parameter (a model settings file, a
+    # temperature the model doesn't accept...). Not the ticket's fault, and another model may well accept it.
+    (r"BadRequestError|INVALID_ARGUMENT|invalid_request_error|Invalid value at", "invalid_request"),
+    (r"NotFoundError|model.*not (found|exist)|does not exist|decommissioned|\b404\b", "model_not_found"),
+    (r"APIConnectionError|ServiceUnavailable|InternalServerError|overloaded|\b50[0-4]\b|timed? ?out|Timeout|APIError", "provider_down"),
 ]
 _EDIT_FAILED = re.compile(r"SearchReplaceNoExactMatch|did not match any|failed to match|UnifiedDiffNoMatch", re.I)
 # Provider errors are checked first: Aider prints help links (including the edit-errors page) next to them.
@@ -54,22 +55,27 @@ def llm_problem(output: str) -> str | None:
     if not lines:
         return None
     blob = "\n".join(lines)
-    if re.search(r"PerDay", output):  # a daily quota: waiting a minute can't help, so say so (and let a fallback model take over)
-        model = (re.search(r'"model":\s*"([^"]+)"', output) or [None, "the model"])[1]
+    # A daily quota: waiting a minute can't help, so say so (and let a fallback model take over). Aider prints Google's
+    # full error ("PerDay", "retryDelay"); OpenCode only its message ("model: gemini-2.5-flash ... retry in 19h15m").
+    hours_left = re.search(r"retry in (\d+)h", output)
+    if re.search(r"PerDay", output) or (hours_left and int(hours_left.group(1)) >= 1):
+        model = (re.search(r'"model":\s*"([^"]+)"', output) or re.search(r"\bmodel: ([\w.\-/]+)", output) or [None, "the model"])[1]
         delay = re.search(r'"retryDelay":\s*"(\d+)s"', output)
-        resets = f" It resets in about {max(1, round(int(delay.group(1)) / 3600))} hour(s)." if delay else ""
+        hours = round(int(delay.group(1)) / 3600) if delay else int(hours_left.group(1)) if hours_left else 0
+        resets = f" It resets in about {max(1, hours)} hour(s)." if delay or hours_left else ""
         return (f"The daily free quota for {model} is used up (daily quota: free keys allow only a few requests per day per model).{resets} "
-                "Set a fallback model (PLANNER_FALLBACK_MODEL / AIDER_FALLBACK_MODEL), switch models, or use a key with billing.\n"
+                "Set a fallback model (PLANNER_FALLBACK_MODEL / AIDER_FALLBACK_MODEL / OPENCODE_FALLBACK_MODEL), switch models, or use a key with billing.\n"
                 f"Provider said: {lines[0][:200]}")
-    for pattern, reason in _LLM_PROBLEMS:
+    for pattern, code in _LLM_PROBLEMS:
         if re.search(pattern, blob, re.I):
-            return f"{reason}\nProvider said: {lines[0][:300]}"
+            return f"{reason(code)}\nProvider said: {lines[0][:300]}"
     return None
 
 
 def retryable_llm_problem(problem: str | None) -> bool:
-    """Rate limits and provider outages can pass or be avoided with another model; a bad key or a blocked prompt can't."""
-    return bool(problem) and ("rate or usage limit" in problem or "daily quota" in problem or "unavailable or timed out" in problem)
+    """Problems another model can get around (the `backup` column in app/errors.py): rate limits, outages and
+    model-specific setup errors. A bad key or a blocked prompt would fail on the fallback too."""
+    return bool(problem) and kind_of(problem).backup
 
 
 _NOISE = ("Aider v", "Main model:", "Model:", "Git repo:", "Repo-map:", "Added ", "Tokens:", "Cost:", "Warning:",
@@ -83,7 +89,7 @@ def aider_reply(output: str, limit: int = 1200) -> str:
 
 
 def is_rate_limit(problem: str | None) -> bool:
-    return bool(problem) and "rate or usage limit" in problem
+    return bool(problem) and kind_of(problem).code == "rate_limit"
 
 
 def empty_reply(output: str) -> bool:
@@ -94,8 +100,39 @@ def empty_reply(output: str) -> bool:
     ]
     return len("\n".join(body).strip()) < 40
 
+def coder_problem(output: str, backend: str) -> str | None:
+    """llm_problem() for whichever backend produced `output` (same plain-words reasons for both)."""
+    return oc.opencode_problem(output, llm_problem) if backend == "opencode" else llm_problem(output)
+
+
+def coder_reply(output: str, backend: str, limit: int = 1200) -> str:
+    return oc.opencode_reply(output, limit) if backend == "opencode" else aider_reply(output, limit)
+
+
+def coder_empty(output: str, backend: str) -> bool:
+    """True if the model said (almost) nothing, typically a blocked or empty completion."""
+    return len(oc.opencode_reply(output)) < 5 if backend == "opencode" else empty_reply(output)
+
+
+def coder_stopped(output: str, backend: str) -> str | None:
+    """Why the agent was cut off before finishing, if it was (OpenCode only: Aider runs are one call)."""
+    if backend == "opencode" and "[stopped] step limit" in output:
+        return ("The coding agent used up its limit of model requests (OPENCODE_MAX_STEPS) without making a change. "
+                "Use a smaller or more specific ticket (name the files), or raise the limit.")
+    return None
+
+
+def strip_credentials(url: str) -> str:
+    """https://x-access-token:SECRET@github.com/o/r.git -> https://github.com/o/r.git"""
+    return re.sub(r"^(https?://)[^/@]+@", r"\1", url)
+
+
 class AgentError(Exception):
-    pass
+    """A failure to report. `code` (a kind in app/errors.py) when the raiser knows it; else it's recognised from the text."""
+
+    def __init__(self, message: str = "", code: str | None = None):
+        super().__init__(message)
+        self.code = code
 
 
 def build_task_prompt(issue: JiraIssue, plan: str = "", history: str = "", deleted: list[str] | None = None) -> str:
@@ -143,6 +180,21 @@ MAX_DELETIONS = 10
 AIDER_MODEL_SETTINGS_FILE = Path(__file__).resolve().parent.parent / "aider-model-settings.yml"
 
 
+def aider_settings_file(model: str, dest_dir: Path) -> Path:
+    """The model settings file Aider gets: aider-model-settings.yml, plus "send no temperature" for a model that
+    shouldn't get one (see pr_writer.takes_temperature) and isn't listed there. Aider would otherwise send 0."""
+    if takes_temperature(model):
+        return AIDER_MODEL_SETTINGS_FILE
+    import yaml  # (installed with Aider)
+
+    entries = yaml.safe_load(AIDER_MODEL_SETTINGS_FILE.read_text()) or []
+    if any(e.get("name") == model for e in entries):
+        return AIDER_MODEL_SETTINGS_FILE
+    path = dest_dir / "model-settings.yml"
+    path.write_text(yaml.safe_dump(entries + [{"name": model, "use_temperature": False}], sort_keys=False))
+    return path
+
+
 def mentioned_files(issue: JiraIssue, tracked: list[str], repo_dir: Path) -> list[str]:
     """Repo files the ticket names by path or basename, so Aider can edit them directly.
 
@@ -159,6 +211,7 @@ def mentioned_files(issue: JiraIssue, tracked: list[str], repo_dir: Path) -> lis
 
 
 MAX_CONTEXT_FILES = 8
+DELIVERY_TRAILER = "Agent-Delivery: "
 MAX_DELIVERY_DIFF = 12000  # characters of a round's diff kept for later follow-ups
 
 
@@ -218,9 +271,10 @@ def branch_name(issue: JiraIssue) -> str:
 class CodingAgent:
     def __init__(
         self, settings: Settings, job: Job | None = None, plan: str = "", plan_files: list[str] | None = None,
-        followup: dict | None = None, deletions: list[str] | None = None,
+        followup: dict | None = None, deletions: list[str] | None = None, delivery_id: str = "",
     ):
         self.s = settings
+        self.delivery_id = delivery_id  # stamped into the commit, see Session.delivery_id
         self.jira = JiraClient(settings)
         self.gh = GitHubClient(settings)
         self.job = job or Job(issue_key="?", event="manual")
@@ -291,8 +345,11 @@ class CodingAgent:
             self.job.finish(status, detail)
         except Exception as e:
             error = self._redact(str(e))
-            self.job.finish("failed", error[-1500:])
-            log.exception("Job failed at step %r", next(reversed(self.job.steps), "start"))
+            kind = kind_of(error, getattr(e, "code", None))
+            self.job.finish("failed", error[-1500:], code=kind.code)
+            log.exception("Job failed at step %r (%s)", next(reversed(self.job.steps), "start"), kind.code)
+            if kind.admin:
+                log.error("ADMIN: %s needs fixing [%s]: %s", issue_key, kind.code, error[:300])
             try:
                 self.jira.add_comment(issue_key, f"🤖 I couldn't finish this ticket. {explain(error)} (Reference: {self.job.id})")
             except Exception:
@@ -356,40 +413,44 @@ class CodingAgent:
                 with job.step("delete_files"):
                     self._apply_deletions(repo_dir)
             crlf = crlf_files(repo_dir)
-            with job.step("aider"):  # the prompt tells the model which files are already gone, so it does the rest of the plan
-                aider_log = self._run_aider(issue, repo_dir)
-            job.add_tokens(*parse_aider_tokens(aider_log), model=self.s.aider_model, step="code")
+            backend, cname = self.s.backend, self.s.backend  # "aider" | "opencode": also names the job steps
+            with job.step(cname):  # the prompt tells the model which files are already gone, so it does the rest of the plan
+                aider_log = self._run_coder(issue, repo_dir, step="code")
             restore_crlf(repo_dir, crlf)
-            if self.deleted and llm_problem(aider_log):
-                job.warnings.append("The AI service had a problem, so only the file deletions were made; the rest of the plan was not done. " + explain(llm_problem(aider_log)))
+            if self.deleted and coder_problem(aider_log, backend):
+                job.warnings.append("The AI service had a problem, so only the file deletions were made; the rest of the plan was not done. " + explain(coder_problem(aider_log, backend)))
 
             self._git("add", "-A", cwd=repo_dir)
+            if backend == "opencode" and coder_problem(aider_log, backend) and self._git("status", "--porcelain", cwd=repo_dir).strip():
+                # an agent can fail after it has already edited files: say so instead of presenting half a change as done
+                job.warnings.append("The AI service had a problem partway through, so this change may be incomplete. " + explain(coder_problem(aider_log, backend)))
             if not self._git("status", "--porcelain", cwd=repo_dir).strip():
-                first_problem = llm_problem(aider_log)
-                if is_rate_limit(first_problem) and not self.s.aider_fallback_model and self.s.rate_limit_wait_seconds:
+                first_problem = coder_problem(aider_log, backend)
+                if is_rate_limit(first_problem) and not self.s.coder_fallback_model and self.s.rate_limit_wait_seconds:
                     log.warning("Rate limited; waiting %ss and trying the same model once more", self.s.rate_limit_wait_seconds)
                     job.warnings.append("The AI service was busy, so I waited a moment and tried again.")
                     time.sleep(self.s.rate_limit_wait_seconds)
-                    with job.step("aider_retry"):
-                        aider_log = self._run_aider(issue, repo_dir)
-                    job.add_tokens(*parse_aider_tokens(aider_log), model=self.s.aider_model, step="code_retry")
+                    with job.step(f"{cname}_retry"):
+                        aider_log = self._run_coder(issue, repo_dir, step="code_retry")
                     restore_crlf(repo_dir, crlf)
                     self._git("add", "-A", cwd=repo_dir)
-                    first_problem = llm_problem(aider_log)
-                if retryable_llm_problem(first_problem) and self.s.aider_fallback_model:
-                    log.warning("Main model failed (%s); retrying once with %s", first_problem.splitlines()[0], self.s.aider_fallback_model)
+                    first_problem = coder_problem(aider_log, backend)
+                if retryable_llm_problem(first_problem) and self.s.coder_fallback_model:
+                    log.warning("Main model failed (%s); retrying once with %s", first_problem.splitlines()[0], self.s.coder_fallback_model)
                     job.warnings.append("The main AI service wasn't available, so a backup service did the work.")
-                    with job.step("aider_fallback"):
-                        aider_log = self._run_aider(issue, repo_dir, model=self.s.aider_fallback_model)
-                    job.add_tokens(*parse_aider_tokens(aider_log), model=self.s.aider_fallback_model, step="code_fallback")
+                    with job.step(f"{cname}_fallback"):
+                        aider_log = self._run_coder(issue, repo_dir, model=self.s.coder_fallback_model, step="code_fallback")
                     restore_crlf(repo_dir, crlf)
                     self._git("add", "-A", cwd=repo_dir)
             if not self._git("status", "--porcelain", cwd=repo_dir).strip():
-                problem = llm_problem(aider_log) or ("The model returned an empty reply (possibly blocked by its content filter)." if empty_reply(aider_log) else None)
+                stopped = coder_stopped(aider_log, backend)
+                problem = coder_problem(aider_log, backend) or ("The model returned an empty reply (possibly blocked by its content filter)." if coder_empty(aider_log, backend) and not stopped else None)
                 if problem:
                     raise AgentError(f"The LLM call failed, so nothing was changed. {problem}")
-                log.info("Aider made no changes. Output tail: %s", aider_log[-500:].replace("\n", " | "))
-                said = aider_reply(aider_log) or "(the model gave no explanation)"
+                if stopped:  # the model worked; the agent ran out of requests before it changed anything
+                    raise AgentError(f"Nothing was changed. {stopped}")
+                log.info("%s made no changes. Output tail: %s", cname, aider_log[-500:].replace("\n", " | "))
+                said = coder_reply(aider_log, backend) or "(the model gave no explanation)"
                 self.jira.add_comment(
                     issue_key,
                     "🤖 I looked at the code and didn't change anything. Here is what I found:\n"
@@ -408,9 +469,11 @@ class CodingAgent:
             with job.step("describe"):
                 usage: dict[str, int] = {}
                 description = describe_changes(
-                    self.s.aider_model, issue, self._git("diff", "--cached", cwd=repo_dir), usage=usage
+                    self.s.aider_model, issue, self._git("diff", "--cached", cwd=repo_dir), usage=usage,
+                    fallback=self.s.aider_fallback_model,
                 )
-            job.add_tokens(usage.get("sent", 0), usage.get("received", 0), model=self.s.aider_model, step="pr_description")
+            job.add_tokens(usage.get("sent", 0), usage.get("received", 0), model=usage.get("model", self.s.aider_model),
+                           step="pr_description", reported_cost=usage.get("cost"))
             if description is None:
                 log.warning("PR description generation failed; using fallback description")
             summary = summary_line(description)
@@ -421,6 +484,8 @@ class CodingAgent:
                 )
                 if fu:
                     commit_msg = f"{issue.key} (round {fu['round']}): {summary or issue.summary}\n\nJira: {jira_url}"
+                if self.delivery_id:
+                    commit_msg += f"\n\n{DELIVERY_TRAILER}{self.delivery_id}"
                 self._git("commit", "-m", commit_msg, cwd=repo_dir)
                 diff_stat = self._git("diff", "--stat", f"{base}..HEAD", cwd=repo_dir) if not continuing else self._git("diff", "--stat", "HEAD~1", "HEAD", cwd=repo_dir)
                 round_diff = self._git("diff", "HEAD~1", "HEAD", cwd=repo_dir)[:MAX_DELIVERY_DIFF]
@@ -502,12 +567,11 @@ class CodingAgent:
         if result.status != "failed":
             return result, aider_log
 
-        log.warning("Syntax errors, asking Aider to fix them: %s", " | ".join(result.errors))
-        with self.job.step("aider_fix"):
-            fix_log = self._run_aider(
-                issue, repo_dir, message=build_fix_prompt(issue, result.errors), files=result.failed_files
+        log.warning("Syntax errors, asking %s to fix them: %s", self.s.backend, " | ".join(result.errors))
+        with self.job.step(f"{self.s.backend}_fix"):
+            fix_log = self._run_coder(
+                issue, repo_dir, message=build_fix_prompt(issue, result.errors), files=result.failed_files, step="fix"
             )
-        self.job.add_tokens(*parse_aider_tokens(fix_log), model=self.s.aider_model, step="fix")
         restore_crlf(repo_dir, crlf)
         self._git("add", "-A", cwd=repo_dir)
 
@@ -515,6 +579,170 @@ class CodingAgent:
         result.retried = True
         log.info("Check %s after fix attempt: %s - %s", result.name, result.status, result.summary)
         return result, f"{aider_log}\n\n----- fix attempt after syntax check -----\n{fix_log}"
+
+    # ------------------------------------------------------------------------------------------------------------
+    # Coding step: one entry point for both backends. Everything outside this (clone, commit, push, PR) is shared.
+    # ------------------------------------------------------------------------------------------------------------
+    def _run_coder(
+        self, issue: JiraIssue, repo_dir: Path, message: str | None = None, files: list[str] | None = None,
+        *, model: str | None = None, step: str = "code",
+    ) -> str:
+        """Run the configured coding backend once, record its token use on the job, and return its text log."""
+        if self.s.backend == "opencode":
+            return self._run_opencode(issue, repo_dir, message=message, files=files, model=model, step=step)
+        kwargs: dict = {}
+        if message is not None:
+            kwargs["message"] = message
+        if files is not None:
+            kwargs["files"] = files
+        if model is not None:
+            kwargs["model"] = model
+        out = self._run_aider(issue, repo_dir, **kwargs)
+        self.job.add_aider(out, model=model or self.s.aider_model, step=step)
+        return out
+
+    def _repair_git_state(self, repo_dir: Path, branch: str, head: str) -> None:
+        """Undo anything the agent did to git itself. Only this app commits: the agent's commits are folded back into
+        the working tree (so they end up in the app's single commit) and it is put back on the app's branch."""
+        current = self._git("rev-parse", "--abbrev-ref", "HEAD", cwd=repo_dir).strip()
+        if current != branch:
+            self.job.warnings.append("The coding agent switched git branches on its own; I put it back.")
+            try:
+                self._git("checkout", "-q", branch, cwd=repo_dir)
+            except AgentError as e:
+                raise AgentError(f"The coding agent left the repository on branch {current!r} and I couldn't switch back to {branch!r}.") from e
+        if self._git("rev-parse", "HEAD", cwd=repo_dir).strip() != head:
+            self.job.warnings.append("The coding agent made a git commit on its own; I folded its work into my own commit.")
+            self._git("reset", "--soft", head, cwd=repo_dir)
+
+    def _run_opencode(
+        self, issue: JiraIssue, repo_dir: Path, message: str | None = None, files: list[str] | None = None,
+        *, model: str | None = None, step: str = "code",
+    ) -> str:
+        """Run OpenCode once in the clone. It may edit files (and run tests); it may not commit or push."""
+        s, job = self.s, self.job
+        model = model or s.opencode_model
+        if files is None:
+            tracked = [p for p in self._git("ls-files", "-z", cwd=repo_dir).split("\0") if p]
+            files = merge_files(mentioned_files(issue, tracked, repo_dir), self.plan_files, tracked, repo_dir)
+            job.files = files
+            log.info("Files hinted to OpenCode (ticket + plan): %s", files or "none (it will search the repo itself)")
+        task = message or build_task_prompt(issue, self.plan, (self.followup or {}).get("history", ""), self.deleted)
+        prompt = oc.build_prompt(task, files, s.opencode_allow_bash)
+
+        run_dir = Path(s.workdir) / f"{issue.key}-opencode"  # private HOME/session store for this run, deleted afterwards
+        shutil.rmtree(run_dir, ignore_errors=True)
+        (run_dir / "home").mkdir(parents=True)
+        cache = Path(s.workdir) / ".opencode-cache"
+        cache.mkdir(parents=True, exist_ok=True)
+        env = oc.build_env(models=[model], home=run_dir / "home", cache=cache, pass_env=s.opencode_pass_env)
+        secrets = oc.secret_values(env)
+
+        def redact(text: str) -> str:
+            text = self._redact(text)
+            for value in secrets:
+                text = text.replace(value, "***")
+            return text
+
+        exclude = repo_dir / ".git" / "info" / "exclude"
+        if ".opencode/" not in exclude.read_text():  # (a syntax-fix run uses the same clone)
+            with open(exclude, "a") as f:
+                f.write("\n.opencode/\n")
+        # Before the agent runs: remember git's config and the branch position, and take the GitHub token out of the
+        # remote URL so a shell command like `git remote -v` or `cat .git/config` can't reveal it.
+        git_config = repo_dir / ".git" / "config"
+        saved_config = git_config.read_bytes()
+        head = self._git("rev-parse", "HEAD", cwd=repo_dir).strip()
+        branch = self._git("rev-parse", "--abbrev-ref", "HEAD", cwd=repo_dir).strip()
+        # (`config --get`, not `remote get-url`: the latter applies url.*.insteadOf rewrites and would return a different URL)
+        origin = self._git("config", "--get", "remote.origin.url", cwd=repo_dir).strip()
+        self._git("remote", "set-url", "origin", strip_credentials(origin), cwd=repo_dir)
+
+        label = "fix" if message else "code"
+        record_model = f"opencode:{model}"
+        prompt_sent = redact(task)
+        log.info("Running OpenCode with model %s (bash %s, max %s model requests)", model, "on" if s.opencode_allow_bash else "off", s.opencode_max_steps or "unlimited")
+        try:
+            try:
+                run = oc.run_opencode(
+                    binary=s.opencode_bin, cwd=repo_dir, prompt=prompt, model=model, env=env,
+                    config=oc.build_config(allow_bash=s.opencode_allow_bash, extra_json=s.opencode_extra_config),
+                    timeout=s.opencode_timeout_seconds, max_steps=s.opencode_max_steps, variant=s.opencode_variant,
+                    title=f"{issue.key} {label}",
+                )
+            except oc.OpenCodeNotInstalled as e:
+                job.record_run(label, record_model, prompt_sent, f"(OpenCode could not start: {e})", ok=False)
+                raise AgentError(
+                    f"OpenCode could not be started ({redact(str(e))}). Install it (the Dockerfile does) or set CODING_BACKEND=aider."
+                ) from e
+        finally:
+            # After the agent: restore git's config byte for byte (this also puts the token URL back for the app's own
+            # push) and delete any hooks it planted, so nothing the agent wrote can run when the app commits or pushes.
+            git_config.write_bytes(saved_config)
+            shutil.rmtree(repo_dir / ".git" / "hooks", ignore_errors=True)
+            shutil.rmtree(run_dir, ignore_errors=True)
+            self._repair_git_state(repo_dir, branch, head)
+
+        text = oc.render_log(run, redact)
+        if run.stopped == "timeout":
+            job.record_run(label, record_model, prompt_sent, text, ok=False)
+            raise AgentError(f"OpenCode timed out after {s.opencode_timeout_seconds}s")
+        self._add_opencode_tokens(run, model, step)
+        if run.stopped == "max_steps":
+            job.warnings.append(
+                f"The coding agent was stopped after {len(run.steps)} model requests (OPENCODE_MAX_STEPS), so the change may be incomplete."
+            )
+        log.info("OpenCode finished: %d request(s), %d tokens in / %d out, %d tool call(s), %.1fs",
+                 len(run.steps), run.sent, run.received, len(run.tools), run.duration_s)
+        job.record_run(label, record_model, prompt_sent, text, ok=not run.errors)
+        return text
+
+    def _add_opencode_tokens(self, run: "oc.OpenCodeRun", model: str, step: str) -> None:
+        # One call entry per model request, so /usage shows how many requests the agent needed (Aider counts one per run).
+        for st in run.steps or [{"sent": 0, "received": 0, "cache_hit": 0, "cache_write": 0, "cost": 0.0}]:
+            self.job.add_tokens(
+                st["sent"], st["received"], model=model, step=step, backend="opencode",
+                cache_hit=st["cache_hit"], cache_write=st["cache_write"], reported_cost=round(st["cost"], 6),
+            )
+
+    def run_opencode_readonly(self, issue: JiraIssue, repo_dir: Path, prompt: str, *, model: str, step: str,
+                              timeout: int, max_steps: int) -> str:
+        """OpenCode with no edit and no shell rights (used for planning): it reads and searches; its last message is
+        the answer. The caller's clone must not hold credentials (the planner strips them right after cloning)."""
+        s, job = self.s, self.job
+        run_dir = Path(s.workdir) / f"{issue.key}-opencode-{step}"
+        shutil.rmtree(run_dir, ignore_errors=True)
+        (run_dir / "home").mkdir(parents=True)
+        cache = Path(s.workdir) / ".opencode-cache"
+        cache.mkdir(parents=True, exist_ok=True)
+        env = oc.build_env(models=[model], home=run_dir / "home", cache=cache, pass_env=s.opencode_pass_env)
+        secrets = oc.secret_values(env)
+
+        def redact(text: str) -> str:
+            text = self._redact(text)
+            for value in secrets:
+                text = text.replace(value, "***")
+            return text
+
+        record_model = f"opencode:{model}"
+        log.info("Running OpenCode read-only (%s) with model %s, max %s model requests", step, model, max_steps or "unlimited")
+        try:
+            run = oc.run_opencode(
+                binary=s.opencode_bin, cwd=repo_dir, prompt=prompt, model=model, env=env,
+                config=oc.build_config(allow_bash=False, read_only=True, extra_json=s.opencode_extra_config),
+                timeout=timeout, max_steps=max_steps, variant=s.opencode_variant, title=f"{issue.key} {step}",
+            )
+        except oc.OpenCodeNotInstalled as e:
+            job.record_run(step, record_model, redact(prompt), f"(OpenCode could not start: {e})", ok=False)
+            raise AgentError(f"OpenCode could not be started ({redact(str(e))}). Install it or set PLANNER_BACKEND=aider.") from e
+        finally:
+            shutil.rmtree(run_dir, ignore_errors=True)
+        text = oc.render_log(run, redact)
+        self._add_opencode_tokens(run, model, step)
+        log.info("OpenCode (%s) finished: %d request(s), %d tokens in / %d out, %d tool call(s), %.1fs",
+                 step, len(run.steps), run.sent, run.received, len(run.tools), run.duration_s)
+        job.record_run(step, record_model, redact(prompt), text, ok=not run.errors and not run.stopped)
+        return text
 
     def _run_aider(
         self,
@@ -562,7 +790,7 @@ class CodingAgent:
             "--analytics-disable",
             "--chat-history-file", str(history_dir / "chat.md"),
             "--input-history-file", str(history_dir / "input.txt"),
-            "--model-settings-file", str(AIDER_MODEL_SETTINGS_FILE),
+            "--model-settings-file", str(aider_settings_file(model or self.s.aider_model, history_dir)),
         ]
         if files:
             # The named files are all the model needs; the repo map would only add tokens.

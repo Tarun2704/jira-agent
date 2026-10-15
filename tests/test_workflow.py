@@ -7,7 +7,7 @@ from app.config import Settings
 from app.jira_client import JiraIssue
 from app.jobs import Job
 from app.planner import PlanResult
-from app.slack_client import ACTION_BACK, ACTION_CONFIRM, ACTION_PROCEED
+from app.slack_client import ACTION_BACK, ACTION_CONFIRM, ACTION_PROCEED, ACTION_RETRY
 from app.store import (
     AWAITING_REPLY, CONFIRMING, DELIVERED, DONE, EXECUTING, PLANNING, REVISING, SessionStore,
 )
@@ -32,6 +32,21 @@ class FakeSlack:
 class FakeGitHub:
     def __init__(self):
         self.prs, self.comments, self.fail = {}, {}, False
+        self.heads = {}  # branch -> newest commit message
+
+    def branch_head_message(self, branch):
+        return self.heads.get(branch)
+
+    def open_pr_for_branch(self, branch):
+        return next(({"number": p["number"], "url": p["url"], "branch": branch} for p in self.prs.values()
+                     if p["branch"] == branch and p["state"] == "open"), None)
+
+    def find_open_pr_for_issue(self, key):
+        return next((p["url"] for p in self.prs.values() if p["branch"].startswith(f"ai/{key}") and p["state"] == "open"), None)
+
+    @staticmethod
+    def pr_number(url):
+        return int(url.rsplit("/", 1)[1])
 
     def get_pr(self, number):
         if self.fail:
@@ -59,6 +74,10 @@ class FakeJira:
     def human_comments_since(self, key, since_ts=0.0):
         return list(getattr(self, "human", []))
 
+    def transition_to(self, key, status):
+        self.moves = getattr(self, "moves", []) + [(key, status)]
+        return "moved"
+
 
 @pytest.fixture
 def env(monkeypatch):
@@ -77,6 +96,8 @@ def env(monkeypatch):
 
     e = Env()
     e.wf, e.store, e.slack, e.jira, e.submitted, e.settings, e.gh = wf, store, slack, jira, submitted, settings, gh
+    e.later = []  # (delay, fn) scheduled by the workflow; tests run them by hand
+    wf._later = lambda delay, fn: e.later.append((delay, fn))
     e.plans = [PlanResult("- mobile too?", "## Questions\n- mobile too?\n\n## Plan\n1. fix `a.py`", files=["a.py"])]
 
     class FakePlanner:
@@ -85,6 +106,7 @@ def env(monkeypatch):
 
         def run(self, issue, session, context="", branch=None):
             e.seen_messages = [m["text"] for m in session.messages]
+            e.seen_force_plan = session.force_plan
             plan = e.plans.pop(0)
             if isinstance(plan, Exception):
                 raise plan
@@ -233,7 +255,7 @@ def test_proceed_then_confirm_then_execute_with_plan(env, monkeypatch):
     given = {}
 
     class FakeAgent:
-        def __init__(self, settings, job, plan="", plan_files=None, followup=None, deletions=None):
+        def __init__(self, settings, job, plan="", plan_files=None, followup=None, deletions=None, delivery_id=""):
             given["plan"], given["files"], self.job = plan, plan_files, job
 
         def handle_issue(self, key):
@@ -310,7 +332,7 @@ def test_execution_outcomes_are_reported(env, monkeypatch, job_status, expected)
     env.wf.on_action(ACTION_CONFIRM, "CA-1", ME, "D1", root)
 
     class FakeAgent:
-        def __init__(self, settings, job, plan="", plan_files=None, followup=None, deletions=None):
+        def __init__(self, settings, job, plan="", plan_files=None, followup=None, deletions=None, delivery_id=""):
             self.job = job
 
         def handle_issue(self, key):
@@ -339,6 +361,24 @@ def test_lease_blocks_a_second_worker(env):
     job = plan_job(env)
     assert job.status == "skipped" and env.slack.posts == []
     assert env.store.has_lease("CA-1")  # the other worker's lease is untouched
+
+
+def test_a_job_skipped_by_a_dead_workers_lease_runs_once_the_lease_lapses(env):
+    """2026-10-14 e2e: a restart while a job was still posting its result left the lease behind; the owner's next
+    message started a plan job that was skipped, and nothing ran until a /tick (or ever, without a pinger)."""
+    env.wf.on_trigger("CA-1")
+    env.submitted.clear()
+    assert env.store.acquire_lease("CA-1", "dead-process", 30)
+    assert plan_job(env).status == "skipped"
+    [(delay, again)] = env.later
+    assert 30 <= delay <= 33  # waits out the lease, no longer
+    env.store.release_lease("CA-1", "dead-process")  # (it lapses)
+    again()
+    assert env.submitted == [("plan", "CA-1")]
+    env.later.clear()
+    plan_job(env)  # the plan is made; a retry firing afterwards finds nothing to do
+    again()
+    assert env.submitted == [("plan", "CA-1")] and env.store.get("CA-1").status == AWAITING_REPLY
 
 
 def test_tick_requeues_orphaned_jobs_only(env):
@@ -442,7 +482,7 @@ def test_aider_runs_are_saved_for_observability_and_scrubbed(env, monkeypatch):
     env.wf.on_action(ACTION_CONFIRM, "CA-1", ME, "D1", env.store.get("CA-1").slack_thread_ts)
 
     class FakeAgent:
-        def __init__(self, settings, job, plan="", plan_files=None, followup=None, deletions=None):
+        def __init__(self, settings, job, plan="", plan_files=None, followup=None, deletions=None, delivery_id=""):
             self.job = job
 
         def handle_issue(self, key):
@@ -564,8 +604,8 @@ class RecordingAgent:
     calls: list = []
     delivery = {"branch": "ai/CA-1-fix", "pr_number": 12, "pr_url": PR_URL, "diff": "+new line", "summary": "Fixed it"}
 
-    def __init__(self, settings, job, plan="", plan_files=None, followup=None, deletions=None):
-        self.job, self.followup, self.plan, self.deletions = job, followup, plan, deletions
+    def __init__(self, settings, job, plan="", plan_files=None, followup=None, deletions=None, delivery_id=""):
+        self.job, self.followup, self.plan, self.deletions, self.delivery_id = job, followup, plan, deletions, delivery_id
         RecordingAgent.calls.append(self)
 
     def handle_issue(self, key):
@@ -625,6 +665,138 @@ def test_a_question_after_delivery_is_answered_and_starts_no_round(env, monkeypa
     s = env.store.get("CA-1")
     assert s.status == DELIVERED and s.round_no == 1 and len(s.rounds) == 1 and not s.followup
     assert any("I changed a.py only." in u["text"] for u in env.slack.updates)
+
+
+def _approved_then_failed(env, monkeypatch):
+    env.plans[:] = [PlanResult("", "## Plan\n1. add `crime_summary.py`", files=["crime_summary.py"])]
+    env.wf.on_trigger("CA-1")
+    plan_job(env)
+    approve(env)
+
+    class FailingAgent:
+        def __init__(self, settings, job, **kw):
+            self.job = job
+
+        def handle_issue(self, key):
+            self.job.finish("failed", "The LLM provider's rate or usage limit was hit.")
+
+    monkeypatch.setattr(wf_mod, "CodingAgent", FailingAgent)
+    job = Job("CA-1", "x", kind="execute")
+    job.start()
+    env.wf.run_execute_job(job)
+    s = env.store.get("CA-1")
+    assert s.status == DELIVERED and s.rounds[-1]["outcome"] == "failed"
+    return env.slack.posts[-1]
+
+
+def test_retry_after_a_failed_run_reruns_the_approved_plan_without_planning_again(env, monkeypatch):
+    """CA-11: after an approved plan failed to code, "can u try again" must re-run the coding step with that same plan,
+    not plan again (the plan was already approved)."""
+    failure = _approved_then_failed(env, monkeypatch)
+    assert any(b["type"] == "actions" for b in failure["blocks"])  # the Retry button
+    env.submitted.clear()
+    plans_left = len(env.plans)
+    assert env.wf.on_user_message("D1", "", ME, "can u try again", "8.3") == "retrying"
+    s = env.store.get("CA-1")
+    assert s.status == EXECUTING and s.rounds == [] and s.round_no == 1 and s.plan_version == 1
+    assert env.submitted == [("execute", "CA-1")] and len(env.plans) == plans_left  # no planner call
+    # and it delivers like a first attempt: round 1, the normal branch (not a follow-up "-r2" branch)
+    run_execute(env, monkeypatch)
+    s = env.store.get("CA-1")
+    assert s.status == DELIVERED and [r["outcome"] for r in s.rounds] == ["delivered"] and RecordingAgent.calls[-1].followup is None
+
+
+def test_the_retry_button_does_the_same_and_only_once(env, monkeypatch):
+    failure = _approved_then_failed(env, monkeypatch)
+    env.submitted.clear()
+    assert env.wf.on_action(ACTION_RETRY, "CA-1", ME, "D1", failure["ts"]) == "retrying"
+    assert env.wf.on_action(ACTION_RETRY, "CA-1", ME, "D1", failure["ts"]) == "ignored_retry"
+    assert env.submitted == [("execute", "CA-1")] and env.store.get("CA-1").status == EXECUTING
+
+
+def test_a_run_restarted_after_its_push_is_recorded_not_redone(env, monkeypatch):
+    """2026-10-14 e2e: the container was killed after round 2 was pushed but before the ticket was marked delivered.
+    The recovered job coded the same change again on top of itself and reported "I couldn't make that change"."""
+    env.plans[:] = [PlanResult("", "## Plan\n1. fix `a.py`", files=["a.py"])]
+    delivered(env, monkeypatch)
+    env.gh.prs[12] = {"number": 12, "url": PR_URL, "state": "open", "draft": False, "branch": "ai/CA-1-fix"}
+    env.plans.append(PlanResult("", "## Plan\n1. more"))
+    env.wf.on_user_message("D1", "", ME, "more please", "8.5")
+    plan_job(env)
+    approve(env)
+    s = env.store.get("CA-1")
+    assert s.status == EXECUTING and s.delivery_id
+    # the first attempt pushed its commit (stamped with this run's id), then the process died
+    env.gh.heads["ai/CA-1-fix"] = f"CA-1 (round 2): more\n\nJira: x\n\nAgent-Delivery: {s.delivery_id}"
+    calls_before = len(RecordingAgent.calls)
+    run_execute(env, monkeypatch)
+    s = env.store.get("CA-1")
+    assert len(RecordingAgent.calls) == calls_before  # not coded again
+    assert s.status == DELIVERED and s.rounds[-1]["outcome"] == "delivered" and s.rounds[-1]["pr_url"] == PR_URL
+    assert "wasn't redone" in env.slack.posts[-1]["text"]
+
+
+def test_an_older_runs_commit_on_the_branch_does_not_count(env, monkeypatch):
+    env.plans[:] = [PlanResult("", "## Plan\n1. fix `a.py`", files=["a.py"])]
+    delivered(env, monkeypatch)
+    env.gh.prs[12] = {"number": 12, "url": PR_URL, "state": "open", "draft": False, "branch": "ai/CA-1-fix"}
+    env.gh.heads["ai/CA-1-fix"] = "CA-1: fix\n\nAgent-Delivery: some-earlier-run"
+    env.plans.append(PlanResult("", "## Plan\n1. more"))
+    env.wf.on_user_message("D1", "", ME, "more please", "8.6")
+    plan_job(env)
+    approve(env)
+    calls_before = len(RecordingAgent.calls)
+    run_execute(env, monkeypatch)
+    assert len(RecordingAgent.calls) == calls_before + 1 and RecordingAgent.calls[-1].delivery_id == env.store.get("CA-1").delivery_id
+
+
+def test_a_setup_problem_gets_no_retry_button_but_text_retry_still_works(env, monkeypatch):
+    """Retrying is pointless until the admin fixes the setting; the message says so instead of offering a button."""
+    env.plans[:] = [PlanResult("", "## Plan\n1. add `x.py`", files=["x.py"])]
+    env.wf.on_trigger("CA-1")
+    plan_job(env)
+    approve(env)
+
+    class MissingModel:
+        def __init__(self, settings, job, **kw):
+            self.job = job
+
+        def handle_issue(self, key):
+            self.job.finish("failed", "The LLM call failed, so nothing was changed. The model name wasn't found at the provider.",
+                            code="model_not_found")
+
+    monkeypatch.setattr(wf_mod, "CodingAgent", MissingModel)
+    job = Job("CA-1", "x", kind="execute")
+    job.start()
+    env.wf.run_execute_job(job)
+    failure = env.slack.posts[-1]
+    assert not any(b["type"] == "actions" for b in failure.get("blocks") or [])  # no Retry button
+    assert "setup problem" in failure["text"] and "Once the admin has fixed this" in failure["text"]
+    assert env.store.get("CA-1").rounds[-1]["code"] == "model_not_found"
+    env.submitted.clear()
+    assert env.wf.on_user_message("D1", "", ME, "retry", "8.7") == "retrying"  # (after the fix) a reply still re-runs it
+    assert env.submitted == [("execute", "CA-1")]
+
+
+def test_a_change_request_after_a_failed_run_still_goes_to_the_planner(env, monkeypatch):
+    _approved_then_failed(env, monkeypatch)
+    assert env.wf.on_user_message("D1", "", ME, "try again but put it in src/", "8.4") == "followup"
+    assert env.store.get("CA-1").status == REVISING
+
+
+def test_a_question_after_a_delivered_pr_is_still_just_answered(env, monkeypatch):
+    env.plans[:] = [PlanResult("", "## Plan\n1. fix `a.py`", files=["a.py"])]
+    delivered(env, monkeypatch)
+    env.plans.append(PlanResult("", "", reply="It changed a.py.", changed=False))
+    env.wf.on_user_message("D1", "", ME, "what changed?", "8.4")
+    plan_job(env)
+    assert env.seen_force_plan is False and env.store.get("CA-1").status == DELIVERED
+
+
+def test_a_new_tickets_first_plan_posts_no_empty_acknowledgement(env):
+    env.wf.on_trigger("CA-1")
+    plan_job(env)
+    assert not any("Taken into account" in p["text"] for p in env.slack.posts)
 
 
 def test_a_thank_you_after_delivery_starts_nothing(env, monkeypatch):
@@ -754,6 +926,7 @@ def test_a_merged_pr_completes_the_ticket_and_later_messages_get_a_clear_answer(
     assert env.wf.tick()["merged"] == ["CA-1"]
     assert "was merged" in env.slack.posts[-1]["text"] and any("merged" in c[1] for c in env.jira.comments)
     assert env.store.get("CA-1").status == DONE and "CA-1" not in env.store.active_keys()
+    assert env.jira.moves == [("CA-1", "Done")]  # the Jira ticket follows the merge
     # under the old result message, or with the ticket key in front, you're told it is completed
     assert env.wf.on_user_message("D1", result_ts, ME, "also add logging") == "rejected:done"
     assert "is completed" in env.slack.posts[-1]["text"] and "new Jira ticket" in env.slack.posts[-1]["text"]
@@ -971,3 +1144,43 @@ def test_re_adding_the_label_retries_a_first_plan_that_failed(env):
     plan_job(env)
     assert env.store.get("CA-1").plan.startswith("## Plan")
     assert env.wf.on_trigger("CA-1") is False  # now a plan exists and is waiting: ignored as before
+
+
+def test_slack_messages_from_an_outage_are_kept_and_sent_later_in_order(env):
+    env.wf.on_trigger("CA-1")
+    plan_job(env)
+    s = env.store.get("CA-1")
+    real_post = env.slack.post
+
+    def down(*a, **k):
+        raise RuntimeError("slack is down")
+
+    env.slack.post = down
+    assert env.wf._say(s, "first: the PR is open") is None
+    assert env.wf._say(s, "second: failed", sc_retry_blocks("CA-1"), important=True) is None
+    assert env.wf.flush_slack() == 0  # still down: nothing lost
+    assert [m["tries"] for m in env.store.take_slack()] == [1, 0]
+    env.wf._say(s, "first: the PR is open")
+    env.wf._say(s, "second: failed", sc_retry_blocks("CA-1"))
+    env.slack.post = real_post
+    n = len(env.slack.posts)
+    assert env.wf.watchdog()["slack_sent"] == 2
+    first, second = env.slack.posts[n:]
+    assert "Delayed: Slack couldn't be reached" in first["text"] and "first: the PR is open" in first["text"]
+    assert "Delayed" in second["blocks"][0]["elements"][0]["text"] and any(b["type"] == "actions" for b in second["blocks"])
+    assert env.store.key_for_thread(second["channel"], second["ts"]) == "CA-1"  # replies under it still work
+    assert env.store.take_slack() == []
+
+
+def test_watchdog_restarts_a_dead_job_without_waiting_for_tick(env):
+    env.wf.on_trigger("CA-1")
+    env.submitted.clear()
+    assert env.store.acquire_lease("CA-1", "alive", 30)
+    assert env.wf.watchdog()["requeued"] == []  # a job is working on it
+    env.store.release_lease("CA-1", "alive")  # it died; its lease lapsed
+    assert env.wf.watchdog()["requeued"] == ["CA-1"] and env.submitted == [("plan", "CA-1")]
+
+
+def sc_retry_blocks(key):
+    from app.slack_client import retry_blocks
+    return retry_blocks("failed", key)

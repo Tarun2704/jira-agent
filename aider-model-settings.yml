@@ -9,3 +9,8 @@
         threshold: BLOCK_NONE
       - category: HARM_CATEGORY_DANGEROUS_CONTENT
         threshold: BLOCK_NONE
+
+# Claude Opus 5.5 rejects sampling parameters (a 400 on any temperature), and Aider sends one unless told not to.
+- name: claude-opus-5-5
+  edit_format: diff
+  use_temperature: false

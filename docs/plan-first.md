@@ -76,8 +76,10 @@ there unchanged). The laptop runs nothing; the Render webhook (`coding-agent`) i
 
 - **First start / after changing `.env`:** copy `.env` to the server (`scp -i ~/.ssh/oracle_jira_agent .env ubuntu@<ip>:~/jira-agent/`),
   then on the server `cd ~/jira-agent && sudo NGROK_AUTHTOKEN=... NGROK_URL=https://...ngrok-free.dev ./scripts/vm-start.sh`.
-- **Deploy code changes:** `./scripts/vm-deploy.sh` from the laptop (copies the code, builds on the server, restarts the
-  app; ~15 s when only app code changed, several minutes when `requirements.txt` changed).
+- **Production runs GitHub `main`.** The server has a git clone in `~/jira-agent` (its `.env` is git-ignored and stays).
+  To deploy after merging a PR: `./scripts/vm-deploy.sh` from the laptop (fetches `main` on the server, builds, restarts
+  the app; seconds when only app code changed, several minutes when `requirements.txt` changed). `BRANCH=feature/x
+  ./scripts/vm-deploy.sh` tries a pushed branch; deploy `main` again afterwards.
 - **1 GB is tight:** the server has a 2 GB swap file and runs **one job at a time** (`SEPARATE_PLAN_QUEUE=false`, set by
   the scripts on servers under ~1.8 GB). Measured: an OpenCode plan peaked at 769 MB of memory plus 313 MB of swap and
   took ~100 s (vs ~45 s on a laptop). Without swap it would be killed.

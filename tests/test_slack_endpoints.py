@@ -298,3 +298,19 @@ def test_the_watchdog_runs_with_the_app(monkeypatch):
         assert any(t.name == "watchdog" for t in threading.enumerate())
         assert runs.wait(5)
     config.get_settings.cache_clear()
+
+
+@pytest.mark.parametrize("subtype", ["thread_broadcast", "file_share"])
+def test_a_thread_reply_also_sent_to_the_chat_and_a_message_with_a_file_still_count(api, subtype):
+    post_event(api, dm_event(subtype=subtype, text="also handle mobile"))
+    assert api.wf.messages == [("D1", "1.1", ME, "also handle mobile")]
+
+
+def test_an_attached_file_gets_a_note_that_only_text_is_read(api, monkeypatch):
+    from app import main
+    told = []
+    monkeypatch.setattr(main, "_tell_user", lambda channel, text, thread_ts="": told.append((channel, text, thread_ts)))
+    post_event(api, dm_event("EvF1", subtype="file_share", files=[{"name": "error.png"}], text=""))
+    assert api.wf.messages == [] and "can't open attached files" in told[0][1] and told[0][2] == "1.1"
+    post_event(api, dm_event("EvF2", subtype="file_share", files=[{"name": "error.png"}], text="see the error"))
+    assert api.wf.messages == [("D1", "1.1", ME, "see the error")] and len(told) == 2

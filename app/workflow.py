@@ -85,6 +85,7 @@ class Workflow:
         self._github = github_factory or (lambda: GitHubClient(settings))
         self._sleep = time.sleep  # (tests replace it)
         self._later = _run_later  # (tests replace it)
+        self.busy = lambda key: False  # is a job for this ticket queued or running in this process? (set by main)
         self.deferred_triggers: set[str] = set()  # tickets whose start failed (Redis down); retried on the next tick
         self._tick_guard = threading.Lock()  # one tick at a time in this process (the Redis lock covers other instances)
 
@@ -184,7 +185,18 @@ class Workflow:
         ref = self._post_reliably(s.slack_channel, text, blocks, thread_ts=thread_ts, key=s.issue_key)
         if ref is None and important:
             self._jira_comment(s.issue_key, "🤖 (I couldn't reach Slack, so this is posted here instead)\n" + re.sub(r"[`*]", "", text))
+        self._map(ref, s.issue_key)
         return ref
+
+    def _map(self, ref: dict | None, key: str) -> None:
+        """Replies in a thread under this message belong to `key` (else, with two tickets open, the owner is asked
+        which ticket they mean). Never raises."""
+        if not ref:
+            return
+        try:
+            self.store.map_thread(ref["channel"], ref["ts"], key)
+        except Exception:
+            log.warning("Could not remember the ticket of a Slack message", exc_info=True)
 
     def _save_runs(self, job: Job, kind: str) -> None:
         """Keep the prompts and outputs of this job's Aider runs in Redis. Never raises."""
@@ -442,7 +454,6 @@ class Workflow:
 
         first = not s.slack_thread_ts
         handled = {"n": 0}
-        before = s.handled_upto
 
         def mark(x: Session):
             handled["n"] = len(x.messages)
@@ -465,7 +476,7 @@ class Workflow:
 
         def warn():
             for w in result.warnings:
-                self._say(s, f":warning: {w}")
+                self._say(s, f":warning: {w}", thread_ts=s.reply_to)
 
         if chatting and not result.changed:
             # Just a conversation: answer where you wrote, leave the plan and its version alone.
@@ -502,6 +513,16 @@ class Workflow:
         text = f"{'Follow-up plan' if round_no > 1 else 'Plan'} for {key}: {issue.summary}"
         blocks = sc.plan_blocks(key, issue.summary, result.body, version, bool(result.questions), round_no=round_no)
         with job.step("slack_post"):
+            # Answered first, so the new plan really is below the answer. Only when the planner said something or the
+            # owner is waiting on a "Looking into it..." for what they wrote: a round started by a button, a PR review
+            # or Jira gets just the plan (it would otherwise be followed by a stray "Taken into account").
+            said = result.reply or "Taken into account in the plan."
+            if new_round:
+                said += f" The follow-up plan (round {round_no}) is below."
+            elif not first:
+                said += f" The updated plan (v{version}) is below."
+            if result.reply or self._acked(key, handled["n"]):
+                self._answer(s, handled["n"], said)
             if first:
                 ref = self.slack.post(text, blocks=blocks)
                 self.store.map_thread(ref["channel"], ref["ts"], key)
@@ -513,14 +534,6 @@ class Workflow:
                 channel, thread_ts = s.slack_channel, s.slack_thread_ts
                 if not new_round:  # (the previous round's plan message is already locked as approved)
                     self._supersede(s, version)
-            said = result.reply or "Taken into account in the plan."
-            if new_round:
-                said += f" The follow-up plan (round {round_no}) is below."
-            elif not first:
-                said += f" The updated plan (v{version}) is below."
-            if result.reply or not first or handled["n"] > before:
-                self._answer(s, handled["n"], said)
-            # (else: a brand-new ticket's first plan, with nothing you wrote to answer: the plan says it all)
             warn()
 
         def finish(x: Session):
@@ -566,9 +579,14 @@ class Workflow:
             log.warning("Could not post the answer for %s", s.issue_key, exc_info=True)
         self.store.update(s.issue_key, lambda x: setattr(x, "pending_acks", [a for a in x.pending_acks if a.get("i", 0) >= upto]))
 
+    def _acked(self, key: str, upto: int) -> bool:
+        """Is a "Looking into it..." waiting for an answer to one of the first `upto` messages?"""
+        fresh = self.store.get(key)
+        return bool(fresh and any(a.get("i", 0) < upto for a in fresh.pending_acks))
+
     def _say_in(self, s: Session, text: str) -> None:
         # exactly where the owner wrote: main chat if they wrote there (never into the plan's thread instead)
-        self.slack.post(text, channel=s.slack_channel, blocks=sc.reply_blocks(text), thread_ts=s.reply_to)
+        self._map(self.slack.post(text, channel=s.slack_channel, blocks=sc.reply_blocks(text), thread_ts=s.reply_to), s.issue_key)
 
     def _supersede(self, s: Session, new_version: int, again: bool = False) -> None:
         """Old plans stay readable; they just lose their Proceed button and say which version replaced them."""
@@ -761,7 +779,8 @@ class Workflow:
             return "ignored_retry"
         if message_ts:  # the button: it can't be pressed twice
             self._update(channel, message_ts, "Retrying.", f":repeat: _Retrying *{key}* with the approved plan..._")
-        self._say(s, f":repeat: *Retrying {key}* with the approved plan (v{s.plan_version}). I'll post the result here.")
+        self._say(s, f":repeat: *Retrying {key}* with the approved plan (v{s.plan_version}). I'll post the result in the main chat.",
+                  thread_ts=thread_ts)
         self._jira_comment(key, "🤖 Retrying the approved plan after the previous attempt failed.")
         self.submit(EXECUTE_JOB, key)
         return "retrying"
@@ -812,9 +831,10 @@ class Workflow:
         if action_id == sc.ACTION_PROCEED:
             if not s.plan:
                 return "no_plan"
-            moved = self.store.transition(key, AWAITING_REPLY, CONFIRMING)
+            # (also while confirming: the plan may have been shown again, which took the earlier confirmation away)
+            moved = self.store.transition(key, {AWAITING_REPLY, CONFIRMING}, CONFIRMING)
             if not moved:
-                return f"ignored:{s.status}"
+                return self._stale_click(key, channel)
             # The question replaces the Proceed button on the very message you clicked, so it can't be missed.
             body = [b for b in sc.plan_blocks(key, moved.title, moved.plan, moved.plan_version, False, round_no=moved.round_no) if b["type"] not in ("actions", "context")]
             confirm = sc.confirm_blocks(key, moved.title, bool(moved.questions), self._strategy_note(moved))
@@ -828,7 +848,7 @@ class Workflow:
         if action_id == sc.ACTION_BACK:
             moved = self.store.transition(key, CONFIRMING, AWAITING_REPLY)
             if not moved:
-                return f"ignored:{s.status}"
+                return self._stale_click(key, channel)
             try:  # put the plan, with its Proceed button, back
                 self.slack.update(channel, message_ts, f"Plan for {key}: {moved.title}",
                                   sc.plan_blocks(key, moved.title, moved.plan, moved.plan_version, bool(moved.questions), round_no=moved.round_no))
@@ -839,13 +859,26 @@ class Workflow:
         if action_id == sc.ACTION_CONFIRM:
             moved = self.store.transition(key, CONFIRMING, EXECUTING, delivery_id=uuid.uuid4().hex[:12])
             if not moved:
-                return f"ignored:{s.status}"
+                return self._stale_click(key, channel)
             self._lock_plan_message(moved, message_ts)
             self._say(moved, f":rocket: *Started {key}.* I'll post the pull request here when it's ready. This can't be stopped from Slack yet.")
             self._jira_comment(key, "🤖 Plan approved in Slack. Starting work now.")
             self.submit(EXECUTE_JOB, key)
             return "executing"
         return "unknown_action"
+
+    def _stale_click(self, key: str, channel: str) -> str:
+        """A plan button that no longer applies (you wrote meanwhile, it already started...): say why, not nothing."""
+        s = self.store.get(key)
+        status = s.status if s else "missing"
+        if s and status in (PLANNING, REVISING):
+            text = f"*{key}*: I'm updating the plan from your latest message. Approve the new version when it arrives."
+        elif s and status not in TERMINAL:
+            text = f"*{key}*: that button no longer applies. The ticket is {self._state_words(s)}."
+        else:
+            text = f"*{key}*: that button no longer applies. The ticket is completed."
+        self._reply_loose(channel, "", text)
+        return f"ignored:{status}"
 
     def _strategy(self, s: Session) -> dict:
         """How this round's code gets delivered. Raises if GitHub can't be asked.
@@ -1172,8 +1205,8 @@ class Workflow:
 
     def _close_stale_acks(self, s: Session) -> bool:
         """A "Looking into it..." that nothing is working on any more (the process died): close it and say so."""
-        if s.status in RUNNING and self.store.has_lease(s.issue_key):
-            return False
+        if s.status in RUNNING and (self.store.has_lease(s.issue_key) or self.busy(s.issue_key)):
+            return False  # being worked on, or queued behind another ticket's job (one job at a time on a small server)
         cutoff = time.time() - self.s.ack_stale_seconds
         stale = [a for a in s.pending_acks if a.get("at", time.time()) < cutoff]
         if not stale:

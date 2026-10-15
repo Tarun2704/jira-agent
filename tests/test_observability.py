@@ -1,5 +1,7 @@
 import logging
 
+import pytest
+
 from app.jobs import Job, JobStore, RedactTokenFilter, parse_aider_tokens
 from tests.test_webhook import SECRET, _issue, _post, client  # noqa: F401  (fixture)
 
@@ -86,8 +88,6 @@ def test_gemini_3_gets_no_temperature_from_aider_or_direct_calls(tmp_path):
     """litellm: a temperature below 1.0 can make Gemini 3 models loop or reason worse; Aider would send 0."""
     import yaml
 
-    from aider.models import Model, register_models
-
     from app.agent import AIDER_MODEL_SETTINGS_FILE, aider_settings_file
     from app.pr_writer import takes_temperature
 
@@ -98,8 +98,9 @@ def test_gemini_3_gets_no_temperature_from_aider_or_direct_calls(tmp_path):
     entries = yaml.safe_load(path.read_text())
     assert {"name": "gemini/gemini-3.5-flash-lite", "use_temperature": False} in entries
     assert any(e["name"] == "gemini/gemini-2.5-flash" for e in entries)  # the shared settings are kept
-    register_models([str(path)])
-    assert Model("gemini/gemini-3.5-flash-lite").use_temperature is False  # Aider really reads it that way
+    aider_models = pytest.importorskip("aider.models")  # (CI installs only requirements-dev.txt, without Aider)
+    aider_models.register_models([str(path)])
+    assert aider_models.Model("gemini/gemini-3.5-flash-lite").use_temperature is False  # Aider really reads it that way
 
 
 def test_logs_never_show_api_keys_or_tokens(capsys):

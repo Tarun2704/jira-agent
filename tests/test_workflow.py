@@ -243,7 +243,8 @@ def test_proceed_then_confirm_then_execute_with_plan(env, monkeypatch):
     assert "a.py" in str(shown["blocks"])  # the plan stays on screen
     confirm = {"ts": root}
     assert ("execute", "CA-1") not in env.submitted  # NOT started by the first click
-    assert env.wf.on_action(ACTION_PROCEED, "CA-1", ME, "D1", root) == "ignored:confirming"  # double click
+    assert env.wf.on_action(ACTION_PROCEED, "CA-1", ME, "D1", root) == "confirming"  # double click: same question again
+    assert env.store.get("CA-1").status == CONFIRMING and ("execute", "CA-1") not in env.submitted
 
     assert env.wf.on_action(ACTION_CONFIRM, "CA-1", ME, "D1", confirm["ts"]) == "executing"
     assert env.store.get("CA-1").status == EXECUTING
@@ -1218,3 +1219,83 @@ def test_watchdog_restarts_a_dead_job_without_waiting_for_tick(env):
 def sc_retry_blocks(key):
     from app.slack_client import retry_blocks
     return retry_blocks("failed", key)
+
+
+# ---- the Slack experience: nothing silent, nothing out of place --------------------------------------------------
+
+
+def test_a_round_started_by_a_button_has_no_stray_answer_after_its_plan(env, monkeypatch):
+    """Nobody wrote anything, so there is nothing to answer; and an answer posted after the plan can't say "below"."""
+    env.plans[:] = [PlanResult("", "## Plan\n1. fix `a.py`", files=["a.py"])]
+    delivered(env, monkeypatch)
+    env.gh.prs[12] = {"number": 12, "url": PR_URL, "state": "open", "draft": True, "branch": "ai/CA-1-fix"}
+    env.gh.comments[12] = [review("talk:7", "make the count configurable", "")]
+    env.wf.tick()
+    ask = env.slack.posts[-1]
+    button = [b for blk in ask["blocks"] if blk["type"] == "actions" for b in blk["elements"]][0]
+    env.wf.on_action(button["action_id"], "CA-1", ME, "D1", ask["ts"])
+    env.plans.append(PlanResult("", "## Plan\n1. read the count from the command line", files=["a.py"]))
+    plan_job(env)
+    assert env.slack.posts[-1]["text"].startswith("Follow-up plan for CA-1")  # the plan is the last word
+
+
+def test_retry_typed_in_a_thread_is_answered_in_that_thread(env, monkeypatch):
+    env.plans[:] = [PlanResult("", "## Plan\n1. fix `a.py`", files=["a.py"])]
+    delivered(env, monkeypatch)
+    env.store.update("CA-1", lambda x: x.rounds[-1].update(outcome="failed"))
+    result_ts = env.slack.posts[-1]["ts"]
+    assert env.wf.on_user_message("D1", result_ts, ME, "retry", "9.1") == "retrying"
+    assert "Retrying CA-1" in env.slack.posts[-1]["text"] and env.slack.posts[-1]["thread_ts"] == result_ts
+
+
+def test_proceed_while_the_plan_is_being_updated_says_so(env):
+    env.wf.on_trigger("CA-1")
+    plan_job(env)
+    ts = env.store.get("CA-1").plan_msg_ts
+    env.wf.on_user_message("D1", "", ME, "also handle mobile", "9.1")  # now revising
+    n = len(env.slack.posts)
+    assert env.wf.on_action(ACTION_PROCEED, "CA-1", ME, "D1", ts) == "ignored:revising"
+    assert len(env.slack.posts) == n + 1 and "updating the plan" in env.slack.posts[-1]["text"]
+
+
+def test_a_plan_shown_again_during_confirmation_can_still_be_approved(env):
+    from app.slack_client import ACTION_SHOW
+    env.wf.on_trigger("CA-1")
+    plan_job(env)
+    env.wf.on_action(ACTION_PROCEED, "CA-1", ME, "D1", env.store.get("CA-1").plan_msg_ts)
+    assert env.store.get("CA-1").status == CONFIRMING
+    env.wf.on_action(ACTION_SHOW, "CA-1", ME, "D1", "")  # "Show plan" from the tickets list
+    shown = env.store.get("CA-1").plan_msg_ts
+    assert env.wf.on_action(ACTION_PROCEED, "CA-1", ME, "D1", shown) == "confirming"
+
+
+def test_replies_under_any_message_about_a_ticket_find_that_ticket(env, monkeypatch):
+    env.plans[:] = [PlanResult("", "## Plan\n1. x", files=["a.py"]), PlanResult("", "## Plan\n1. y", files=["b.py"])]
+    env.wf.on_trigger("CA-2")
+    plan_job(env, "CA-2")  # a second ticket waiting, so a guess isn't possible
+    delivered(env, monkeypatch)
+    started = next(p for p in env.slack.posts if "Started CA-1" in p["text"])
+    env.plans.append(PlanResult("", "", reply="It's running.", changed=False))
+    assert env.wf.on_user_message("D1", started["ts"], ME, "how is it going?", "9.1") != "ambiguous"
+
+
+def test_warnings_go_where_the_owner_wrote(env):
+    env.wf.on_trigger("CA-1")
+    plan_job(env)
+    env.wf.on_user_message("D1", "7.7", ME, "CA-1: also mobile", "9.1")  # in some thread
+    env.store.update("CA-1", lambda x: setattr(x, "reply_to", "7.7"))
+    env.plans.append(PlanResult("", "## Plan\n1. fix `a.py` and mobile", files=["a.py"], warnings=["heads up"]))
+    plan_job(env)
+    warning = next(p for p in env.slack.posts if "heads up" in p["text"])
+    assert warning["thread_ts"] == "7.7"
+
+
+def test_an_acknowledgement_waiting_in_the_queue_is_not_called_lost(env):
+    env.wf.on_trigger("CA-1")
+    plan_job(env)
+    env.wf.on_user_message("D1", "", ME, "also mobile", "9.1")
+    env.store.update("CA-1", lambda x: x.pending_acks[0].update(at=0))  # long ago: a coding run held the queue
+    env.wf.busy = lambda key: True  # its plan job is still queued
+    assert env.wf.tick()["stale"] == []
+    env.wf.busy = lambda key: False  # really lost (the process died)
+    assert env.wf.tick()["stale"] == ["CA-1"]

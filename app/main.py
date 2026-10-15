@@ -52,6 +52,7 @@ def _workflow() -> Workflow:
     if _wf is None:
         s = get_settings()
         _wf = Workflow(s, SessionStore.from_url(s.redis_url), SlackClient(s.slack_bot_token, s.slack_user_id), _submit)
+        _wf.busy = lambda key: key in _in_flight
     return _wf
 
 
@@ -490,6 +491,11 @@ def _with_one_retry(fn):
 
 
 def _handle_slack_message(event: dict) -> None:
+    if event.get("files"):  # the text is read; attachments (screenshots, logs) aren't, so don't let that pass silently
+        _tell_user(event.get("channel", ""), ":paperclip: I can't open attached files yet, only the text of your message. "
+                   "Please paste what matters from it as text.", event.get("thread_ts") or "")
+        if not (event.get("text") or "").strip():
+            return
     try:
         outcome = _with_one_retry(lambda: _workflow().on_user_message(
             event.get("channel", ""), event.get("thread_ts", ""), event.get("user", ""), event.get("text", ""),
@@ -525,8 +531,10 @@ async def slack_events(request: Request, background: BackgroundTasks):
         event.get("user"), event.get("thread_ts") or "-",
     )
     is_dm = event.get("type") == "message" and event.get("channel_type") == "im"
-    # Skip bot messages (our own posts) and edits/joins/etc. (any subtype).
-    if payload.get("type") == "event_callback" and is_dm and not event.get("subtype") and not event.get("bot_id"):
+    # Skip bot messages (our own posts) and edits/deletions/etc. Kept: a thread reply also sent to the chat
+    # (thread_broadcast) and a message with a file (file_share); both are things you wrote.
+    written = event.get("subtype") in (None, "thread_broadcast", "file_share")
+    if payload.get("type") == "event_callback" and is_dm and written and not event.get("bot_id"):
         event_id = payload.get("event_id", "")
         if event_id and not await asyncio.to_thread(_workflow().store.first_seen, event_id):
             return {"ok": True, "duplicate": True}  # Slack redelivery

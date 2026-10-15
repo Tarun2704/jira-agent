@@ -344,6 +344,9 @@ class Workflow:
                 return False
             x.followup, x.force_plan, x.round_source, x.round_request = True, force_plan, source, text
             x.add_message("user", text)
+            # Nobody wrote in Slack (a button, a PR review, a Jira change): the plan goes to the main chat, not into
+            # whatever thread the last conversation happened to be in.
+            x.reply_to = ""
             x.status = REVISING
             x.reminded = False
             x.touch()
@@ -564,7 +567,8 @@ class Workflow:
         self.store.update(s.issue_key, lambda x: setattr(x, "pending_acks", [a for a in x.pending_acks if a.get("i", 0) >= upto]))
 
     def _say_in(self, s: Session, text: str) -> None:
-        self.slack.post(text, channel=s.slack_channel, blocks=sc.reply_blocks(text), thread_ts=s.reply_to or s.slack_thread_ts)
+        # exactly where the owner wrote: main chat if they wrote there (never into the plan's thread instead)
+        self.slack.post(text, channel=s.slack_channel, blocks=sc.reply_blocks(text), thread_ts=s.reply_to)
 
     def _supersede(self, s: Session, new_version: int, again: bool = False) -> None:
         """Old plans stay readable; they just lose their Proceed button and say which version replaced them."""

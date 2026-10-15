@@ -13,8 +13,9 @@ MEM_MB=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)
 
 docker network inspect jira-agent-net >/dev/null 2>&1 || docker network create jira-agent-net >/dev/null
 
+# Redis also listens on the server's own localhost (never the internet), for Redis Insight over an SSH tunnel.
 docker inspect jira-agent-redis >/dev/null 2>&1 || docker run -d --name jira-agent-redis --network jira-agent-net \
-  --restart unless-stopped -v jira-agent-redis-data:/data redis:7-alpine redis-server --appendonly yes >/dev/null
+  --restart unless-stopped -p 127.0.0.1:6379:6379 -v jira-agent-redis-data:/data redis:7-alpine redis-server --appendonly yes >/dev/null
 
 extra=()
 if [ "$MEM_MB" -lt 1800 ]; then  # small server: one job at a time (a plan and a coding run together don't fit)

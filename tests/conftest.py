@@ -23,6 +23,8 @@ def no_plan_mode_by_default(monkeypatch):
     monkeypatch.setenv("PLANNER_BACKEND", "aider")
     from app import config
 
+    # Never read the developer's .env: its values (models, intervals, URLs...) change which path a test takes.
+    monkeypatch.setitem(config.Settings.model_config, "env_file", None)
     config.get_settings.cache_clear()
     yield
     config.get_settings.cache_clear()

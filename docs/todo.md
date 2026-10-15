@@ -19,7 +19,10 @@ fixed"); bigger themes live in [roadmap.md](roadmap.md). Newest first within eac
 - [x] ~~Host the app off the laptop~~: done 2026-10-14 on Oracle's free 1 GB AMD VM (see [plan-first.md](plan-first.md) "Running on a server"). One job at a time, with swap; slower than a laptop.
 - [ ] **Move to the free ARM VM (2 OCPU / 12 GB) when Oracle has capacity**: the retry job (`~/.oci/jira-agent-vm-retry.sh`, every 10 min, up to 14 days) notifies on success. Then planning and coding can run in parallel again.
 - [ ] **Upstash command budget** if Redis moves back to Upstash: free tier is 500K commands/month; with the watchdog every 60 s plus `/tick`, set `WATCHDOG_SECONDS=180` or more. (The server's own Redis has no limit.)
-- [ ] **Pause the Render service and its `/tick` pinger** (cron-job.org/UptimeRobot) until it's the live host again: its Jira webhook is disabled and its tickets were moved to the local Redis, but a running Render app still uses Slack credentials and would answer `/tick`.
+- [x] ~~Production runs GitHub `main`~~ (2026-10-15): the server pulls and builds `main`; `scripts/vm-deploy.sh`. Remove the old copied folder `~/jira-agent.old` on the server once happy.
+- [ ] **Deploy automatically on merge** (optional): a GitHub Action on push to `main` that runs the deploy over SSH (the server's key as a repository secret).
+- [ ] **CI warnings** (2026-10-15): bump `actions/checkout` and `actions/setup-python` off Node 20; `ubuntu-latest` moves to Ubuntu 26 from 2026-10-19.
+- [x] ~~Render service suspended~~ (2026-10-15). Also pause its `/tick` pinger (cron-job.org/UptimeRobot) if one exists.
 - [ ] **Render Free + OpenCode planner**: `PLANNER_BACKEND` now defaults to `opencode` (~550 MB per run); on the 512 MB Free instance set `PLANNER_BACKEND=aider` until the instance is upgraded.
 
 - [x] ~~Structured error codes~~: done 2026-10-14, `app/errors.py` (one table: wording, backup model, Retry button, admin alert). Admin alerts are log lines (`ADMIN: ...`) until messages are routed (below).

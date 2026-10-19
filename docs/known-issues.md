@@ -83,6 +83,8 @@ Kept here so they aren't reintroduced.
 | A message waiting behind another ticket's job just said "Looking into it…" for up to 15 minutes | Nothing said it was queued. | The message, the "Started" note and Retry say what they are waiting for. |
 | A plan made while Slack was unreachable was lost, and you were told "I couldn't produce the plan" | The plan post wasn't retried or kept. | It is kept in Redis and posted (marked "Delayed") when Slack answers; one replaced meanwhile isn't posted. |
 | When OpenCode itself failed (crashed, out of memory, stuck), the ticket failed | Only model problems had a fallback. | Aider does that step instead (`TOOL_FALLBACK`, on by default, when Aider is installed). |
+| A Slack message appeared twice (2026-10-19, "Which ticket is this about?") | Slack posted it but answered after the 20 s timeout; the app took that as a failure and posted a plain-text copy. | An unconfirmed post is looked up in the conversation first (found: not posted again); a plain-text copy only when Slack refuses the formatted message. |
+| The stuck limit (7 min) was close to one slow OpenCode reply on the 1 GB server (a plan: ~6 min for 3 replies) | | `JOB_STUCK_SECONDS` defaults to 600 (10 min). |
 | Tests failed on a developer machine only | Tests read the developer's `.env` (fallback models, backend), which changed the retry path a test exercised. | `tests/conftest.py` blanks those settings. |
 
 ## Troubleshooting

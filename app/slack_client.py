@@ -5,6 +5,7 @@ opens/uses that DM and returns the real channel id (D...), which is stored in th
 """
 import hashlib
 import hmac
+import html
 import logging
 import re
 import time
@@ -34,6 +35,11 @@ class SlackError(Exception):
     pass
 
 
+def refused_content(e: Exception) -> bool:
+    """Slack answered that the message itself is wrong (its blocks or length), not that it is busy or down."""
+    return any(w in str(e) for w in ("invalid_blocks", "invalid_attachments", "msg_too_long", "too_many_attachments", "invalid_arguments"))
+
+
 def verify_signature(signing_secret: str, timestamp: str, body: bytes, signature: str, now: float | None = None) -> bool:
     """Slack signs `v0:<timestamp>:<raw body>` with the app's signing secret (HMAC-SHA256)."""
     try:
@@ -46,12 +52,17 @@ def verify_signature(signing_secret: str, timestamp: str, body: bytes, signature
     return hmac.compare_digest(expected, signature)
 
 
+# Slack may have posted a message although its answer never arrived: look for it before posting again.
+UNSURE = (httpx.ReadTimeout, httpx.WriteTimeout, httpx.RemoteProtocolError, httpx.ReadError)
+
+
 class SlackClient:
-    def __init__(self, token: str, user_id: str):
+    def __init__(self, token: str, user_id: str, transport: httpx.BaseTransport | None = None):
         self.user_id = user_id
         self._client = RetryingClient(
-            base_url=API, headers={"Authorization": f"Bearer {token}"}, timeout=20
+            base_url=API, headers={"Authorization": f"Bearer {token}"}, timeout=20, transport=transport,
         )
+        self._me = ""  # this bot's own user id (auth.test), to recognise its own messages
 
     def _call(self, method: str, payload: dict) -> dict:
         r = self._client.post(f"/{method}", json=payload)
@@ -72,8 +83,34 @@ class SlackClient:
             payload["blocks"] = blocks
         if thread_ts:
             payload["thread_ts"] = thread_ts
-        data = self._call("chat.postMessage", payload)
+        sent_at = time.time()
+        try:
+            data = self._call("chat.postMessage", payload)
+        except UNSURE:
+            # The request may well have been posted (Slack was just slow to answer). Posting again would show it
+            # twice, so look for it first; only if it isn't there does the caller's retry post it again.
+            found = self._find_own(payload["channel"], payload["text"], thread_ts, since=sent_at - 5)
+            if not found:
+                raise
+            log.warning("Slack didn't confirm a post in time, but it was posted (%s); not posting it again", found["ts"])
+            return found
         return {"channel": data["channel"], "ts": data["ts"]}
+
+    def _find_own(self, channel: str, text: str, thread_ts: str, since: float) -> dict | None:
+        """This bot's message with exactly `text`, posted after `since` in `channel` (or that thread). Never raises."""
+        try:
+            if not self._me:
+                self._me = self._call("auth.test", {}).get("user_id", "")
+            if channel.startswith("U"):  # a person's id: their DM with the bot
+                channel = self._call("conversations.open", {"users": channel})["channel"]["id"]
+            method, params = ("conversations.replies", {"ts": thread_ts}) if thread_ts else ("conversations.history", {})
+            r = self._client.get(f"/{method}", params={"channel": channel, "oldest": f"{since:.6f}", "limit": 50, **params})
+            for m in r.json().get("messages", []):
+                if m.get("user") == self._me and html.unescape(m.get("text", "")) == text:
+                    return {"channel": channel, "ts": m["ts"]}
+        except Exception:
+            log.warning("Could not check whether an unconfirmed Slack post arrived", exc_info=True)
+        return None
 
     def delete(self, channel: str, ts: str) -> None:
         self._call("chat.delete", {"channel": channel, "ts": ts})

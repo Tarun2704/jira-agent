@@ -40,6 +40,9 @@ fixed"); bigger themes live in [roadmap.md](roadmap.md). Newest first within eac
 - [x] ~~`.opencode/` appended to `.git/info/exclude` on every run~~ and ~~`.DS_Store` tracked~~: done 2026-10-14.
 - [ ] **Rotate the Gemini API key** if you want to be safe: before 2026-10-14 a failed Gemini call logged its request URL with `?key=...` (local Docker logs; on Render, Render's log viewer). Logs now mask keys and tokens.
 
+- [ ] **Shorter follow-up window** (idea, 2026-10-19): a delivered ticket stays open for follow-ups for `FOLLOWUP_DAYS` (14) after its last activity, so a message without a ticket key can match several old tickets ("Which ticket is this about?"). Consider 3–5 days (server setting, no code change), or closing a ticket when its PR is closed. Trade-off: a late PR review is no longer offered as a round (re-add the label instead).
+- [x] ~~Duplicate Slack message when Slack is slow~~: done 2026-10-19. A post Slack doesn't confirm in time is looked up in the conversation before it is sent again; a plain-text copy is sent only when Slack refuses the formatted message (`invalid_blocks`, too long).
+
 ## Who gets which message (planned)
 
 Today every Slack message goes to `SLACK_USER_ID`. Target:

@@ -1,4 +1,5 @@
 import hashlib
+import pytest
 import hmac
 import time
 
@@ -54,3 +55,53 @@ def test_confirm_blocks_warn_about_open_questions():
     assert "can't be stopped" in b[0]["text"]["text"] and "unanswered" in b[0]["text"]["text"]
     ids = [e["action_id"] for e in b[1]["elements"]]
     assert ids == [sc.ACTION_CONFIRM, sc.ACTION_BACK]
+
+
+# ---- a post Slack made but didn't confirm in time is not posted twice -------------------------------------------------
+
+import httpx  # noqa: E402
+
+from app.slack_client import SlackClient, SlackError, refused_content  # noqa: E402
+
+
+def fake_slack(history, fail_post=True):
+    """A Slack API that times out on chat.postMessage (after "posting" it) and serves `history`."""
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        method = request.url.path.rsplit("/", 1)[-1]
+        calls.append(method)
+        if method == "chat.postMessage":
+            if fail_post:
+                raise httpx.ReadTimeout("slow", request=request)
+            return httpx.Response(200, json={"ok": True, "channel": "D1", "ts": "2.2"})
+        if method == "auth.test":
+            return httpx.Response(200, json={"ok": True, "user_id": "UBOT"})
+        if method == "conversations.open":
+            return httpx.Response(200, json={"ok": True, "channel": {"id": "D1"}})
+        if method in ("conversations.history", "conversations.replies"):
+            return httpx.Response(200, json={"ok": True, "messages": history})
+        return httpx.Response(404)
+
+    return SlackClient("xoxb-t", "U_ME", transport=httpx.MockTransport(handler)), calls
+
+
+def test_an_unconfirmed_post_that_arrived_is_found_not_repeated():
+    client, calls = fake_slack([{"user": "UBOT", "ts": "9.9", "text": "Which ticket? A &amp; B"}])
+    ref = client.post("Which ticket? A & B")  # (Slack escapes & < > in what it stores)
+    assert ref == {"channel": "D1", "ts": "9.9"} and calls.count("chat.postMessage") == 1
+
+
+def test_an_unconfirmed_post_that_did_not_arrive_still_fails():
+    client, calls = fake_slack([{"user": "U_ME", "ts": "9.9", "text": "Which ticket? A & B"}])  # (the person's, not ours)
+    with pytest.raises(httpx.ReadTimeout):
+        client.post("Which ticket? A & B")
+
+
+def test_a_thread_reply_is_looked_for_in_its_thread():
+    client, calls = fake_slack([{"user": "UBOT", "ts": "9.9", "text": "answer"}])
+    assert client.post("answer", channel="D1", thread_ts="5.5")["ts"] == "9.9" and "conversations.replies" in calls
+
+
+def test_only_content_errors_count_as_refused():
+    assert refused_content(SlackError("chat.postMessage: invalid_blocks")) and not refused_content(SlackError("chat.postMessage: internal_error"))

@@ -121,7 +121,7 @@ class Settings(BaseSettings):
     # A running job that shows no sign of life this long (no step, no output line, no agent event) is stopped by the
     # watchdog: its processes are killed, then it falls back to Aider (OpenCode) or is run once more by itself before
     # it is reported as failed. One model reply can take a few minutes, so keep this well above that. 0 = off.
-    job_stuck_seconds: int = 420
+    job_stuck_seconds: int = 600
 
     # Cost tracking: prices for the usual models are built in (app/costs.py DEFAULT_PRICES). This adds models or
     # overrides a built-in price: USD per 1M tokens as JSON, {"model name": [input, output]}. Free tiers: [0, 0].

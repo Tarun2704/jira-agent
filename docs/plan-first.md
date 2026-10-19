@@ -25,7 +25,7 @@ If `SLACK_BOT_TOKEN`, `SLACK_USER_ID` or `REDIS_URL` is empty, the old straight-
 | `TICK_TOKEN` | Secret for `GET /tick?token=…` |
 | `PLANNER_MODEL` | Model for plans and revisions. Empty = same as `AIDER_MODEL` |
 | `WATCHDOG_SECONDS` | How often the app re-queues crashed jobs, stops stuck ones and re-sends Slack messages held back by an outage (default 60; 0 = off) |
-| `JOB_STUCK_SECONDS` | A running job with no sign of life this long (no step, no output line, no agent event) is stopped: OpenCode falls back to Aider, anything else runs once more by itself, then it is reported (default 420; 0 = off) |
+| `JOB_STUCK_SECONDS` | A running job with no sign of life this long (no step, no output line, no agent event) is stopped: OpenCode falls back to Aider, anything else runs once more by itself, then it is reported (default 600; 0 = off) |
 | `PLAN_REMINDER_HOURS` | No reply after this long → Jira comment tagging the reporter (default 48) |
 | `PLAN_WORKERS` | How many plans/revisions run at once (1 to 4, default 1). Each is a clone plus an Aider process (roughly 200-300 MB), so keep 1 on a 512 MB instance |
 | `SEPARATE_PLAN_QUEUE` | `true` (default): plans/revisions have their own worker. `false`: share the single coding worker |

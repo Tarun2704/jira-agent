@@ -86,9 +86,18 @@ there unchanged). The laptop runs nothing; the Render webhook (`coding-agent`) i
 - **First start / after changing `.env`:** copy `.env` to the server (`scp -i ~/.ssh/oracle_jira_agent .env ubuntu@<ip>:~/jira-agent/`),
   then on the server `cd ~/jira-agent && sudo NGROK_AUTHTOKEN=... NGROK_URL=https://...ngrok-free.dev ./scripts/vm-start.sh`.
 - **Production runs GitHub `main`.** The server has a git clone in `~/jira-agent` (its `.env` is git-ignored and stays).
-  To deploy after merging a PR: `./scripts/vm-deploy.sh` from the laptop (fetches `main` on the server, builds, restarts
-  the app; seconds when only app code changed, several minutes when `requirements.txt` changed). `BRANCH=feature/x
-  ./scripts/vm-deploy.sh` tries a pushed branch; deploy `main` again afterwards.
+  **Merging a PR deploys it:** once the Tests workflow passes on `main`, the **Deploy** workflow
+  (`.github/workflows/deploy.yml`) logs into the server and runs `scripts/server-deploy.sh`: it waits for a running job
+  to finish (up to 30 min), fetches `main`, builds and restarts only the app (seconds when only app code changed,
+  several minutes when `requirements.txt` changed). A failed deploy leaves the run red in GitHub's Actions tab.
+  By hand: Actions → Deploy → Run workflow, or `./scripts/vm-deploy.sh` from the laptop (`BRANCH=feature/x` tries a
+  pushed branch; deploy `main` again afterwards; `WAIT_IDLE_SECONDS=0` doesn't wait for running jobs).
+- **The deploy key** (GitHub secret `DEPLOY_SSH_KEY`, with `DEPLOY_HOST` and `DEPLOY_KNOWN_HOSTS`; the laptop keeps it as
+  `~/.ssh/jira_agent_github_deploy`) is a separate key that the server pins to one command in `~/.ssh/authorized_keys`:
+  `command="/home/ubuntu/jira-agent-deploy.sh",no-port-forwarding,no-agent-forwarding,no-X11-forwarding,no-pty ssh-ed25519 ... github-actions-deploy jira-agent`.
+  That wrapper fetches `main` and runs `main`'s own `scripts/server-deploy.sh` (or `~/server-deploy.sh` while `main`
+  doesn't have it yet). Whatever the key asks for, it can only deploy `main` (no shell, no tunnels). To revoke it,
+  delete that line.
 - **1 GB is tight:** the server has a 2 GB swap file and runs **one job at a time** (`SEPARATE_PLAN_QUEUE=false`, set by
   the scripts on servers under ~1.8 GB). Measured: an OpenCode plan peaked at 769 MB of memory plus 313 MB of swap and
   took ~100 s (vs ~45 s on a laptop). Without swap it would be killed.

@@ -1,0 +1,37 @@
+name: Deploy
+
+# After the tests pass on main (a merged PR), deploy main to the server. Also by hand: Actions -> Deploy -> Run workflow.
+on:
+  workflow_run:
+    workflows: [Tests]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy  # one deploy at a time; a newer merge waits for the running one
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  deploy:
+    # only a successful test run of a push to main (not a PR's run)
+    if: github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push')
+    runs-on: ubuntu-latest
+    timeout-minutes: 45  # up to 30 waiting for a running job, then the build
+    environment: production
+    steps:
+      # Secrets: DEPLOY_HOST (ubuntu@<ip>), DEPLOY_SSH_KEY (private key of the deploy-only key),
+      # DEPLOY_KNOWN_HOSTS (the server's host key line, so the connection can't be redirected).
+      # On the server that key is pinned to scripts/server-deploy.sh: it can only deploy main.
+      - name: Deploy over SSH
+        env:
+          SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+          HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key && chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o ServerAliveInterval=60 "$HOST" deploy

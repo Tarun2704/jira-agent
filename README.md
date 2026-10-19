@@ -98,6 +98,8 @@ Copy `.env.example` to `.env` and fill it in. `.env` is gitignored; never commit
 | `PLANNER_BACKEND` | `opencode` (default) or `aider`: who reads the code and writes the plan (independent of `CODING_BACKEND`). OpenCode searches file contents: right on big repos, ~3× the requests; Aider is cheaper on small repos. See [docs/planner-comparison.md](docs/planner-comparison.md) |
 | `OPENCODE_MODEL` | Default `google/gemini-2.5-flash` (`provider/model`; uses your `GEMINI_API_KEY`). Only used with `CODING_BACKEND=opencode` |
 | `OPENCODE_FALLBACK_MODEL`, `OPENCODE_MAX_STEPS`, `OPENCODE_TIMEOUT_SECONDS`, `OPENCODE_ALLOW_BASH`, `OPENCODE_VARIANT`, `OPENCODE_PASS_ENV`, `OPENCODE_EXTRA_CONFIG`, `OPENCODE_BIN` | OpenCode tuning: see [docs/opencode.md §3](docs/opencode.md) (shell access is **off** by default) |
+| `PR_DESCRIPTION_MODEL` | Cheaper model for PR descriptions (litellm name, e.g. `gemini/gemini-3.1-flash-lite`). Empty = `AIDER_MODEL` |
+| `OPENCODE_CHAT_MODEL`, `PLANNER_CHAT_MODEL` | Cheaper model for questions about a plan or a delivered ticket (OpenCode / Aider planner, e.g. `google/gemini-3.1-flash-lite`). If it says the plan should change, the main planner model does the turn, so plans are always written by the main model. Empty = off |
 | `TOOL_FALLBACK` | `true` (default): when OpenCode itself fails (crash, out of memory, stuck, timeout), Aider does that step instead |
 | `JOB_STUCK_SECONDS` | Default 420: a running job with no sign of life this long is stopped by the watchdog, then falls back to Aider (OpenCode) or runs once more by itself before it's reported as failed. 0 = off |
 | `WEBHOOK_SECRET` | Random string; must match the Secret in the Jira webhook |

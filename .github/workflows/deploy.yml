@@ -18,7 +18,7 @@ jobs:
   deploy:
     # only a successful test run of a push to main (not a PR's run)
     if: github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04  # pinned, like the tests
     timeout-minutes: 45  # up to 30 waiting for a running job, then the build
     environment: production
     steps:

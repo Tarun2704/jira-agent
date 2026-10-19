@@ -1409,3 +1409,39 @@ def test_slack_refusing_a_plan_is_still_an_error(env):
     env.slack.post = refuse
     env.wf.on_trigger("CA-1")
     assert plan_job(env).status == "failed"
+
+
+def test_a_waiting_message_says_working_on_it_when_its_job_starts(env):
+    env.wf.on_trigger("CA-1")
+    plan_job(env)
+    env.wf.waiting_for = lambda key: ["CA-9's coding run"]
+    env.wf.on_user_message("D1", "", ME, "also mobile", "9.1")
+    ack = env.slack.posts[-1]
+    env.wf.waiting_for = lambda key: []
+    env.plans.append(PlanResult("", "", reply="Yes, mobile too.", changed=False))
+    plan_job(env)  # its turn came
+    started = [u for u in env.slack.updates if u["ts"] == ack["ts"] and "Working on it now" in u["text"]]
+    assert started and "Waiting for" not in started[0]["text"]
+    assert env.slack.updates[-1]["ts"] == ack["ts"] and "Yes, mobile too." in env.slack.updates[-1]["text"]  # then answered
+    assert env.store.get("CA-1").queued_notes == []
+
+
+def test_a_waiting_start_says_working_on_it_when_the_run_starts(env, monkeypatch):
+    env.plans[:] = [PlanResult("", "## Plan\n1. fix `a.py`", files=["a.py"])]
+    env.wf.on_trigger("CA-1")
+    plan_job(env)
+    env.wf.waiting_for = lambda key: ["CA-9's plan"]
+    approve(env)
+    started = next(p for p in env.slack.posts if "Started CA-1" in p["text"])
+    env.wf.waiting_for = lambda key: []
+    run_execute(env, monkeypatch)
+    update = next(u for u in env.slack.updates if u["ts"] == started["ts"])
+    assert "Working on it now" in update["text"] and "Waiting for" not in update["text"]
+
+
+def test_an_answered_message_is_not_rewritten_when_a_later_job_starts(env):
+    env.wf.on_trigger("CA-1")
+    plan_job(env)
+    env.store.update("CA-1", lambda x: x.queued_notes.append({"channel": "D1", "ts": "7.7", "text": "Looking into it...", "ack": True}))
+    env.wf._now_running("CA-1")  # "7.7" is no longer waiting for an answer
+    assert not [u for u in env.slack.updates if u["ts"] == "7.7"] and env.store.get("CA-1").queued_notes == []

@@ -581,7 +581,9 @@ class Planner:
             chat = chat_style(session)
             parse = parse_chat_output if chat else parse_planner_output
             with self.job.step(f"{backend}_plan"):
-                output = ask(main_model)
+                output = self._cheap_answer(ask, parse, backend, main_model) if chat else None
+                if output is None:
+                    output = ask(main_model)
                 problem = problem_of(output)
                 if parse(output) is None and is_rate_limit(problem) and not fallback and self.s.rate_limit_wait_seconds:
                     log.warning("Planner rate limited; waiting %ss and retrying once", self.s.rate_limit_wait_seconds)
@@ -624,6 +626,29 @@ class Planner:
         # Remember the files the plan is about: later revisions and the coding run start from them.
         result.files = [f for f in dict.fromkeys(self.job.files + plan_files_from_text(result.body, set(tracked))) if f not in valid][:MAX_CONTEXT_FILES]
         return result
+
+    def _cheap_answer(self, ask, parse, backend: str, main_model: str) -> str | None:
+        """A chat turn (a question about the plan, or about a delivered ticket) first goes to the cheaper chat model
+        (OPENCODE_CHAT_MODEL / PLANNER_CHAT_MODEL), if one is set. Its answer is used only if it leaves the plan as it
+        is: when it says the plan should change, or fails, None, and the main model does the turn (plans are always
+        written by the main model)."""
+        cheap = self.s.opencode_chat_model if backend == "opencode" else self.s.planner_chat_model
+        if not cheap or cheap == main_model:
+            return None
+        try:
+            out = ask(cheap)
+        except AgentError as e:
+            log.warning("Chat model %s failed (%s); the main model answers", cheap, str(e).splitlines()[0][:200])
+            return None
+        result = parse(out)
+        if result is None:
+            log.warning("Chat model %s gave no usable answer; the main model answers", cheap)
+            return None
+        if result.changed:
+            log.info("Chat model %s says the plan should change; the main model writes the new version", cheap)
+            return None
+        log.info("Answered with the chat model %s (plan unchanged)", cheap)
+        return out
 
     def _files_for_plan(self, issue: JiraIssue, session: Session, tracked: list[str], repo_dir: Path) -> list[str]:
         """Files named in the ticket or chat, plus those from earlier rounds; else ask the model to find them."""

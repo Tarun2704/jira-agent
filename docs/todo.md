@@ -11,7 +11,7 @@ fixed"); bigger themes live in [roadmap.md](roadmap.md). Newest first within eac
   - `PLANNER_BACKEND` now defaults to `opencode`: the instance needs 1 GB+ even with `CODING_BACKEND=aider` (2 GB if planning and coding overlap), or set `PLANNER_BACKEND=aider` on Free.
   - OpenCode needs an instance with 1 GB+ memory (Free has 512 MB).
 - [ ] **Decide what to do with the comparison PRs** #38 (CA-10, Aider) and #39 (CA-11, OpenCode) on Crimes-in-India: same task, both correct. Merge one, close the other.
-- [ ] **Clean up the e2e test artifacts** ([e2e-test-report.md](e2e-test-report.md)): Jira CA-12 … CA-20 (label `ai-agent-e2e`) and PRs #40 … #45.
+- [x] ~~Clean up the test artifacts~~: done 2026-10-19 (Jira CA-10 … CA-28 Done, PRs #38 … #50 closed; their `ai/CA-*` branches are still on GitHub).
 
 ## Bugs and gaps found, not fixed yet
 
@@ -19,15 +19,16 @@ fixed"); bigger themes live in [roadmap.md](roadmap.md). Newest first within eac
 - [x] ~~Host the app off the laptop~~: done 2026-10-14 on Oracle's free 1 GB AMD VM (see [plan-first.md](plan-first.md) "Running on a server"). One job at a time, with swap; slower than a laptop.
 - [ ] **Move to the free ARM VM (1 OCPU / 6 GB, as the stack asks) when Oracle has capacity**: the retry job (`~/.oci/jira-agent-vm-retry.sh`, every 10 min, up to 14 days) notifies on success. Then planning and coding can run in parallel again.
 - [ ] **Upstash command budget** if Redis moves back to Upstash: free tier is 500K commands/month; with the watchdog every 60 s plus `/tick`, set `WATCHDOG_SECONDS=180` or more. (The server's own Redis has no limit.)
-- [x] ~~Production runs GitHub `main`~~ (2026-10-15): the server pulls and builds `main`; `scripts/vm-deploy.sh`. Remove the old copied folder `~/jira-agent.old` on the server once happy.
+- [x] ~~Production runs GitHub `main`~~ (2026-10-15): the server pulls and builds `main`; `scripts/vm-deploy.sh`. (The old copied folder `~/jira-agent.old` was removed 2026-10-19.)
 - [x] ~~Deploy automatically on merge~~: done 2026-10-19, `.github/workflows/deploy.yml` after the tests pass (deploy-only SSH key pinned to `scripts/server-deploy.sh`).
-- [ ] **CI warnings** (2026-10-15): bump `actions/checkout` and `actions/setup-python` off Node 20; `ubuntu-latest` moves to Ubuntu 26 from 2026-10-19.
+- [x] ~~CI warnings~~: done 2026-10-19, `actions/checkout@v6` and `actions/setup-python@v6` (Node 24); runners pinned to `ubuntu-24.04` (move to Ubuntu 26 on purpose).
 - [x] ~~Render service suspended~~ (2026-10-15). Also pause its `/tick` pinger (cron-job.org/UptimeRobot) if one exists.
 - [ ] **Render Free + OpenCode planner**: `PLANNER_BACKEND` now defaults to `opencode` (~550 MB per run); on the 512 MB Free instance set `PLANNER_BACKEND=aider` until the instance is upgraded.
 
 - [x] ~~Structured error codes~~: done 2026-10-14, `app/errors.py` (one table: wording, backup model, Retry button, admin alert). Admin alerts are log lines (`ADMIN: ...`) until messages are routed (below).
 - [x] ~~Hung jobs~~: done 2026-10-19, `JOB_STUCK_SECONDS` (no sign of life → stopped; OpenCode falls back to Aider, otherwise one automatic re-run, then a failure with Retry). Not covered: a job hanging *outside* a child process (e.g. an HTTP call with no timeout) is only marked stuck; its own timeouts end it.
-- [ ] **Say when queued work starts**: the "waiting for CA-21's coding run" note isn't updated when the job actually starts (the answer replaces it when it's done).
+- [x] ~~Say when queued work starts~~: done 2026-10-19, the "Waiting for…" message says "Working on it now" when the job starts.
+- [x] ~~Cheaper models for simple jobs~~: done 2026-10-19, `PR_DESCRIPTION_MODEL` and `OPENCODE_CHAT_MODEL` / `PLANNER_CHAT_MODEL` (questions only; plans stay with the main model). Note: `gemini-3.5-flash-lite` costs the same as `gemini-2.5-flash`; `gemini-3.1-flash-lite` is cheaper ($0.25/$1.50 vs $0.30/$2.50 per 1M tokens); `gemini-2.5-flash-lite` is no longer offered to new keys.
 - [ ] **Post Slack messages outside the job lease**: failed posts are now queued (done), but the retries before queueing still run while the job holds its lease.
 - [x] ~~Backup model for the PR description~~: done 2026-10-14 (`AIDER_FALLBACK_MODEL`, tried once; both calls are counted).
 - [ ] **GitHub webhook instead of polling** for PR merged/closed, reviews and comments (`pull_request`, `pull_request_review`, `pull_request_review_comment`, `issue_comment`): instant instead of up to ~10 minutes, and less API use. Needs an endpoint with signature check (`X-Hub-Signature-256`) and the webhook on the repo; keep `/tick` polling as the safety net. Decide what an **approval** should do (today: nothing; merge completes the ticket).

@@ -78,6 +78,14 @@ class Settings(BaseSettings):
     #     plus Aider's repo map. Cheaper; fine on small repos, but on big ones it can plan around code it never saw.
     planner_backend: str = "opencode"
     opencode_planner_model: str = ""  # provider/model for the OpenCode planner. Empty = OPENCODE_MODEL
+    # Cheaper models for turns that don't write a plan: a question about the plan or a delivered ticket is answered by
+    # this model first; if it says the plan should change, the main planner model does the turn instead. Empty = off.
+    # OPENCODE_CHAT_MODEL for PLANNER_BACKEND=opencode (e.g. google/gemini-3.1-flash-lite), PLANNER_CHAT_MODEL for aider.
+    opencode_chat_model: str = ""
+    planner_chat_model: str = ""
+    # The model that writes PR descriptions (a litellm name like AIDER_MODEL, e.g. gemini/gemini-3.1-flash-lite).
+    # Empty = AIDER_MODEL.
+    pr_description_model: str = ""
     opencode_plan_max_steps: int = 20  # model requests one OpenCode plan may use
     plan_reminder_hours: int = 48  # no reply for this long -> Jira comment tagging the reporter
     lease_seconds: int = 300  # a running job refreshes its lease; a lapsed lease = crashed job
@@ -161,6 +169,7 @@ class Settings(BaseSettings):
             models = [("OPENCODE_MODEL", self.opencode_model), ("OPENCODE_FALLBACK_MODEL", self.opencode_fallback_model)]
             if self.planner_backend_used == "opencode":
                 models.append(("OPENCODE_PLANNER_MODEL", self.opencode_planner_model))
+                models.append(("OPENCODE_CHAT_MODEL", self.opencode_chat_model))
             for name, model in models:
                 if not model:
                     continue

@@ -7,7 +7,7 @@ from app.config import Settings
 from app.jira_client import JiraIssue
 from app.jobs import Job
 from app.planner import PlanResult
-from app.slack_client import ACTION_BACK, ACTION_CONFIRM, ACTION_PROCEED, ACTION_RETRY
+from app.slack_client import ACTION_BACK, ACTION_CONFIRM, ACTION_PROCEED, ACTION_RETRY, SlackError
 from app.store import (
     AWAITING_REPLY, CONFIRMING, DELIVERED, DONE, EXECUTING, PLANNING, REVISING, SessionStore,
 )
@@ -585,7 +585,7 @@ def test_a_refused_rich_message_falls_back_to_plain_text(env):
 
     def picky(text, *, channel="", blocks=None, thread_ts=""):
         if blocks:
-            raise RuntimeError("chat.postMessage: invalid_blocks")
+            raise SlackError("chat.postMessage: invalid_blocks")  # (what SlackClient raises when Slack refuses it)
         return real_post(text, channel=channel, blocks=blocks, thread_ts=thread_ts)
 
     env.slack.post = picky
@@ -1065,7 +1065,7 @@ def test_slack_failures_are_retried_then_sent_as_plain_text_then_written_to_jira
 
     def blocked(text, *, channel="", blocks=None, thread_ts=""):
         if blocks:
-            raise RuntimeError("invalid_blocks")
+            raise SlackError("chat.postMessage: invalid_blocks")
         return real_post(text, channel=channel, blocks=None, thread_ts=thread_ts)
 
     env.slack.post = blocked
@@ -1445,3 +1445,32 @@ def test_an_answered_message_is_not_rewritten_when_a_later_job_starts(env):
     env.store.update("CA-1", lambda x: x.queued_notes.append({"channel": "D1", "ts": "7.7", "text": "Looking into it...", "ack": True}))
     env.wf._now_running("CA-1")  # "7.7" is no longer waiting for an answer
     assert not [u for u in env.slack.updates if u["ts"] == "7.7"] and env.store.get("CA-1").queued_notes == []
+
+
+def test_a_slow_slack_never_gets_a_plain_text_copy(env):
+    """2026-10-19: Slack posted "Which ticket is this about?" but answered too late; the plain-text copy made it twice."""
+    import httpx
+
+    def slow(text, **k):
+        raise httpx.ReadTimeout("slow")
+
+    env.slack.post = slow
+    env.wf._reply_loose("D1", "", "Which ticket?", [{"type": "section"}])
+    assert env.slack.posts == []  # nothing posted a second time
+
+
+def test_refused_formatting_still_gets_a_plain_text_copy(env):
+    from app.slack_client import SlackError
+    real = env.slack.post
+
+    def picky(text, blocks=None, **k):
+        if blocks:
+            raise SlackError("chat.postMessage: invalid_blocks")
+        return real(text, **k)
+
+    env.slack.post = picky
+    env.wf._reply_loose("D1", "", "Which ticket?", [{"type": "section"}])
+    assert [p["text"] for p in env.slack.posts] == ["Which ticket?"]
+    env.wf.on_trigger("CA-1")
+    assert env.wf._post_reliably("D1", "result", [{"type": "section"}], key="CA-1")["ts"]  # plain text, right away
+    assert env.slack.posts[-1]["text"] == "result" and env.slack.posts[-1]["blocks"] is None

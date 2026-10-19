@@ -101,7 +101,7 @@ Copy `.env.example` to `.env` and fill it in. `.env` is gitignored; never commit
 | `PR_DESCRIPTION_MODEL` | Cheaper model for PR descriptions (litellm name, e.g. `gemini/gemini-3.1-flash-lite`). Empty = `AIDER_MODEL` |
 | `OPENCODE_CHAT_MODEL`, `PLANNER_CHAT_MODEL` | Cheaper model for questions about a plan or a delivered ticket (OpenCode / Aider planner, e.g. `google/gemini-3.1-flash-lite`). If it says the plan should change, the main planner model does the turn, so plans are always written by the main model. Empty = off |
 | `TOOL_FALLBACK` | `true` (default): when OpenCode itself fails (crash, out of memory, stuck, timeout), Aider does that step instead |
-| `JOB_STUCK_SECONDS` | Default 420: a running job with no sign of life this long is stopped by the watchdog, then falls back to Aider (OpenCode) or runs once more by itself before it's reported as failed. 0 = off |
+| `JOB_STUCK_SECONDS` | Default 600 (10 min; an OpenCode plan on the 1 GB server took ~6 min for 3 slow replies): a running job with no sign of life this long is stopped by the watchdog, then falls back to Aider (OpenCode) or runs once more by itself before it's reported as failed. 0 = off |
 | `WEBHOOK_SECRET` | Random string; must match the Secret in the Jira webhook |
 | `TRIGGER_LABEL` | Default `ai-agent` |
 | `QUEUE_LABEL` | Default `ai-agent-queued`; marks queued/running tickets so they survive restarts (empty = off) |

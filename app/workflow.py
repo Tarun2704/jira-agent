@@ -108,16 +108,23 @@ class Workflow:
         return f"*{key}* · {text}"
 
     def _post_reliably(self, channel: str, text: str, blocks: list | None = None, thread_ts: str = "", key: str = "") -> dict | None:
-        """Post to Slack: three tries with a short wait, then once as plain text. None if all fail; the message is
-        then kept in Redis and sent by the watchdog (or /tick) once Slack answers again."""
+        """Post to Slack: three tries with a short wait (plain text instead, if Slack refuses the formatted version). None
+        if all fail; the message is then kept in Redis and sent by the watchdog (or /tick) once Slack answers again."""
+        refused = False
         for delay in (0, 0.5, 1.5):
             if delay:
                 self._sleep(delay)
             try:
                 return self.slack.post(text, channel=channel, blocks=blocks, thread_ts=thread_ts)
-            except Exception:
+            except sc.SlackError as e:
+                if sc.refused_content(e):  # e.g. invalid_blocks: the same again won't help, plain text may
+                    log.warning("Slack refused the formatted post: %s", e)
+                    refused = True
+                    break
+                log.warning("Slack answered with an error (will retry): %s", e)
+            except Exception:  # (a post Slack made but didn't confirm is found by SlackClient.post, not repeated)
                 log.warning("Slack post failed (will retry)", exc_info=True)
-        if blocks:
+        if blocks and refused:
             try:
                 return self.slack.post(text, channel=channel, thread_ts=thread_ts)
             except Exception:
@@ -912,13 +919,15 @@ class Workflow:
     def _reply_loose(self, channel: str, thread_ts: str, text: str, blocks: list | None = None) -> None:
         try:
             self.slack.post(text, channel=channel, thread_ts=thread_ts, blocks=blocks)
-        except Exception:
-            log.warning("Could not reply in Slack", exc_info=True)
+        except sc.SlackError:
+            log.warning("Slack refused the reply", exc_info=True)
             if blocks:  # the rich version was refused: say it in plain text rather than say nothing
                 try:
                     self.slack.post(text, channel=channel, thread_ts=thread_ts)
                 except Exception:
                     log.warning("Could not reply in Slack (plain text either)", exc_info=True)
+        except Exception:  # unreachable or unsure: a second copy could show the reply twice (see SlackClient.post)
+            log.warning("Could not reply in Slack", exc_info=True)
 
     def on_action(self, action_id: str, key: str, user: str, channel: str, message_ts: str) -> str:
         """A button click. `message_ts` is the message holding the clicked button."""

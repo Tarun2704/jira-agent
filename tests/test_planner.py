@@ -484,3 +484,51 @@ def test_file_discovery_falls_back_to_the_planner_fallback_model(monkeypatch, tm
     asked.clear()
     assert planner.discover_files("gemini/missing", ISSUE, "", ["app.py"], tmp_path, {}, warnings) == []  # no backup set
     assert asked == ["gemini/missing"] and warnings
+
+
+def _chat_session():
+    s = Session("CA-1")
+    s.plan, s.plan_version, s.status = "## Plan\n1. fix the login button", 1, "revising"
+    s.add_message("user", "why only the button?")
+    return s
+
+
+ANSWER_ONLY = "[opencode] model=m\n[said]\nREPLY_START\nBecause it holds the login code.\nREPLY_END\nPLAN_CHANGED: no"
+CHANGES_PLAN = ("[opencode] model=m\n[said]\nREPLY_START\nI'll add b.py.\nREPLY_END\nPLAN_CHANGED: yes\n"
+                "PLAN_START\n## Plan\n1. x in `a.py` and `b.py`\nPLAN_END")
+
+
+def test_a_question_is_answered_by_the_cheaper_chat_model(monkeypatch, tmp_path):
+    p, seen = _opencode_planner(monkeypatch, tmp_path, ANSWER_ONLY, opencode_chat_model="google/lite")
+    result = p.run(ISSUE, _chat_session())
+    assert [r["model"] for r in seen["opencode"]] == ["google/lite"] and not result.changed and "login code" in result.reply
+
+
+def test_a_plan_change_is_left_to_the_main_model(monkeypatch, tmp_path):
+    p, seen = _opencode_planner(monkeypatch, tmp_path, "", opencode_chat_model="google/lite")
+    outputs = iter([CHANGES_PLAN, CHANGES_PLAN])
+    p.agent.run_opencode_readonly = lambda issue, repo_dir, prompt, **k: seen["opencode"].append(k) or next(outputs)
+    result = p.run(ISSUE, _chat_session())
+    assert [r["model"] for r in seen["opencode"]] == ["google/lite", "google/m"] and result.changed
+
+
+def test_a_failing_chat_model_falls_back_to_the_main_model(monkeypatch, tmp_path):
+    from app.agent import AgentError
+    p, seen = _opencode_planner(monkeypatch, tmp_path, "", opencode_chat_model="google/lite")
+    calls = []
+
+    def run(issue, repo_dir, prompt, **k):
+        calls.append(k["model"])
+        if k["model"] == "google/lite":
+            raise AgentError("OpenCode reported an error: quota", code="quota_daily")
+        return ANSWER_ONLY
+
+    p.agent.run_opencode_readonly = run
+    result = p.run(ISSUE, _chat_session())
+    assert calls == ["google/lite", "google/m"] and "login code" in result.reply
+
+
+def test_new_plans_never_use_the_chat_model(monkeypatch, tmp_path):
+    p, seen = _opencode_planner(monkeypatch, tmp_path, PLAN_LOG, opencode_chat_model="google/lite")
+    p.run(ISSUE, Session("CA-1"))  # a first plan: not a chat turn
+    assert [r["model"] for r in seen["opencode"]] == ["google/m"]

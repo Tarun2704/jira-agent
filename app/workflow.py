@@ -439,6 +439,7 @@ class Workflow:
                 log.info("Plan job for %s skipped: session is %s", key, s.status if s else "missing")
                 job.finish("skipped", f"session is {s.status if s else 'missing'}")
                 return
+            self._now_running(key)
             try:
                 outcome = self._plan(job, s)
                 job.finish("succeeded" if outcome == "posted" else "skipped", outcome)
@@ -555,7 +556,7 @@ class Workflow:
             def answered(x: Session):
                 if ref:
                     x.plan_msg_ts = ref["ts"]
-                x.stuck_retried = False
+                x.stuck_retried, x.queued_notes = False, []
                 remember_reply(x)
                 if x.followup:  # a question after delivery: it stays delivered, nothing new starts
                     x.followup = x.force_plan = False
@@ -601,7 +602,7 @@ class Workflow:
             x.plan, x.questions, x.plan_version, x.files = result.body, result.questions, version, result.files
             x.delete_files = list(result.delete_files)
             x.slack_channel, x.slack_thread_ts, x.plan_msg_ts = channel, thread_ts, ref["ts"] if ref else ""
-            x.stuck_retried = False
+            x.stuck_retried, x.queued_notes = False, []
             if new_round:
                 x.round_no, x.followup, x.force_plan = round_no, False, False
                 x.pr_notified = ""
@@ -686,7 +687,7 @@ class Workflow:
 
         def fail(x: Session):
             x.pending_acks = []
-            x.stuck_retried = False
+            x.stuck_retried, x.queued_notes = False, []
             x.slack_channel, x.slack_thread_ts = channel, thread
             x.handled_upto = len(x.messages)
             if x.followup:  # the ticket stays delivered; nothing new started
@@ -822,9 +823,37 @@ class Workflow:
             text = self._tag(key, f"{note} {queued}")
             try:
                 self.slack.update(ref["channel"], ref["ts"], text, sc.reply_blocks(text))
+                self._remember_queued(key, ref, self._tag(key, note), ack=True)
             except Exception:
                 log.warning("Could not add the queue note for %s", key, exc_info=True)
         return result
+
+    def _remember_queued(self, key: str, ref: dict | None, text: str, ack: bool = False) -> None:
+        """Keep a message that says it waits in the queue, so it can say "working on it now" when the job starts."""
+        if not ref:
+            return
+        note = {"channel": ref["channel"], "ts": ref["ts"], "text": text, "ack": ack}
+        try:
+            self.store.update(key, lambda x: x.queued_notes.append(note))
+        except Exception:
+            log.warning("Could not remember the queue note for %s", key, exc_info=True)
+
+    def _now_running(self, key: str) -> None:
+        """This ticket's job has started: its "Waiting for ... to finish first" messages now say it's being worked on.
+        Never raises (an un-updated note only stays a little out of date)."""
+        try:
+            s = self.store.get(key)
+            if not s or not s.queued_notes:
+                return
+            self.store.update(key, lambda x: setattr(x, "queued_notes", []))
+            waiting = {a["ts"] for a in s.pending_acks}
+            for n in s.queued_notes:
+                if n.get("ack") and n["ts"] not in waiting:
+                    continue  # already answered: leave the answer alone
+                text = f"{n['text']} _(Working on it now.)_"
+                self.slack.update(n["channel"], n["ts"], text, sc.reply_blocks(text))
+        except Exception:
+            log.warning("Could not update the queue notes for %s", key, exc_info=True)
 
     def _queued_note(self, key: str) -> str:
         """" (Waiting for CA-21's coding run to finish first: one job runs at a time.)", or "" if it can start now."""
@@ -867,8 +896,10 @@ class Workflow:
             self._update(channel, message_ts, "Retrying.", f":repeat: _Retrying *{key}* with the approved plan..._")
         self.submit(EXECUTE_JOB, key)
         queued = self._queued_note(key)
-        self._say(s, f":repeat: *Retrying {key}* with the approved plan (v{s.plan_version}). I'll post the result in the main chat."
-                     + (f"\n{queued}" if queued else ""), thread_ts=thread_ts)
+        said = f":repeat: *Retrying {key}* with the approved plan (v{s.plan_version}). I'll post the result in the main chat."
+        ref = self._say(s, said + (f"\n{queued}" if queued else ""), thread_ts=thread_ts)
+        if queued:
+            self._remember_queued(key, ref, self._tag(key, said))
         self._jira_comment(key, "🤖 Retrying the approved plan after the previous attempt failed.")
         return "retrying"
 
@@ -950,8 +981,10 @@ class Workflow:
             self._lock_plan_message(moved, message_ts)
             self.submit(EXECUTE_JOB, key)
             queued = self._queued_note(key)
-            self._say(moved, f":rocket: *Started {key}.* I'll post the pull request here when it's ready. This can't be stopped from Slack yet."
-                             + (f"\n{queued}" if queued else ""))
+            said = f":rocket: *Started {key}.* I'll post the pull request here when it's ready. This can't be stopped from Slack yet."
+            ref = self._say(moved, said + (f"\n{queued}" if queued else ""))
+            if queued:
+                self._remember_queued(key, ref, self._tag(key, said))
             self._jira_comment(key, "🤖 Plan approved in Slack. Starting work now.")
             return "executing"
         return "unknown_action"
@@ -1102,6 +1135,7 @@ class Workflow:
             if not s or s.status != EXECUTING:
                 job.finish("skipped", f"session is {s.status if s else 'missing'}")
                 return
+            self._now_running(key)
             followup = None
             try:  # decided now, not at planning time: the PR may have been merged or closed since
                 st = self._strategy(s)
@@ -1169,7 +1203,7 @@ class Workflow:
                 return False
             x.rounds.append(rnd)
             x.status, x.delivered_at, x.followup, x.force_plan, x.result = DELIVERED, time.time(), False, False, detail
-            x.stuck_retried = False
+            x.stuck_retried, x.queued_notes = False, []
             x.pr_notified, x.review_pending = "", {}
             if d.get("pr_number"):
                 x.pr_number, x.pr_url, x.branch = d["pr_number"], d["pr_url"], d.get("branch", "")

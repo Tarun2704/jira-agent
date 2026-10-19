@@ -78,6 +78,9 @@ class Session:
     delivery_id: str = ""
     # The current plan or run was already started once more by itself after getting stuck (only once per attempt).
     stuck_retried: bool = False
+    # Messages that said "Waiting for CA-21's coding run to finish first" ({channel, ts, text without that note}):
+    # updated to "working on it now" when this ticket's job starts.
+    queued_notes: list = field(default_factory=list)
 
     def touch(self) -> None:
         self.last_activity_at = time.time()

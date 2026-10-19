@@ -527,11 +527,13 @@ class CodingAgent:
             jira_url = f"{self.s.jira_base_url.rstrip('/')}/browse/{issue.key}"
             with job.step("describe"):
                 usage: dict[str, int] = {}
+                # PR_DESCRIPTION_MODEL (a cheaper model) if set; the backup is then the usual one, or AIDER_MODEL
+                writer = self.s.pr_description_model or self.s.aider_model
+                backup = self.s.aider_fallback_model if self.s.aider_fallback_model != writer else self.s.aider_model
                 description = describe_changes(
-                    self.s.aider_model, issue, self._git("diff", "--cached", cwd=repo_dir), usage=usage,
-                    fallback=self.s.aider_fallback_model,
+                    writer, issue, self._git("diff", "--cached", cwd=repo_dir), usage=usage, fallback=backup,
                 )
-            job.add_tokens(usage.get("sent", 0), usage.get("received", 0), model=usage.get("model", self.s.aider_model),
+            job.add_tokens(usage.get("sent", 0), usage.get("received", 0), model=usage.get("model", writer),
                            step="pr_description", reported_cost=usage.get("cost"))
             if description is None:
                 log.warning("PR description generation failed; using fallback description")

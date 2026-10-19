@@ -216,3 +216,13 @@ def test_the_watchdog_names_the_step_that_is_running():
     with job.step("opencode_plan"):
         assert job.current_step == "opencode_plan"
     assert job.current_step == "start"
+
+
+def test_pr_descriptions_use_the_cheaper_model_when_set(world, monkeypatch):
+    seen = []
+    monkeypatch.setattr(agent_mod, "describe_changes", lambda model, *a, fallback="", **k: seen.append((model, fallback)) or "Adds a file.")
+    world(pr_description_model="gemini/gemini-3.1-flash-lite", aider_model="gemini/gemini-2.5-flash",
+          aider_fallback_model="gemini/gemini-3.1-flash-lite").handle_issue("CA-1")
+    world(aider_model="gemini/gemini-2.5-flash", aider_fallback_model="gemini/gemini-3.5-flash-lite").handle_issue("CA-1")
+    # the cheap model writes it; its backup is never the same model (then AIDER_MODEL) · not set: as before
+    assert seen == [("gemini/gemini-3.1-flash-lite", "gemini/gemini-2.5-flash"), ("gemini/gemini-2.5-flash", "gemini/gemini-3.5-flash-lite")]

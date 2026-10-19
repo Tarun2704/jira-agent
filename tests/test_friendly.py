@@ -18,7 +18,7 @@ TECHNICAL = ("litellm", "Traceback", "RuntimeError", "HTTPStatusError", "TPM", "
         ("The planning agent used up its limit of 20 model requests (OPENCODE_PLAN_MAX_STEPS)", "allowed number of steps"),
         ("The AI provider rejected the request as invalid (a model setting", "setup problem"),
         ("OpenCode failed before its first model request and gave no reason", "setup problem"),
-        ("Aider timed out after 900s", "didn't respond in time"),
+        ("Aider timed out after 900s", "longer than allowed"),
         ("The LLM call failed. Aider couldn't apply the model's edit (its change didn't match...", "which file and what to change"),
         ("The model returned an empty reply (possibly blocked by its content filter).", "didn't give an answer"),
         ("The planner's reply wasn't in the expected format. Reply to try again.\nstuff", "clear plan"),

@@ -234,7 +234,7 @@ def test_health_flags_opencode_model_names_opencode_cannot_use():
 
 
 def test_step_cap_is_reported_as_a_warning(world):
-    a = world(description="Do it. FAKE_MANY", opencode_max_steps=3)
+    a = world(description="Do it. FAKE_MANY", opencode_max_steps=3, tool_fallback=False)
     a.handle_issue("CA-1")
     # the agent was cut off before it edited anything: a clear failure that names the setting, not "empty reply"
     assert a.job.status == "failed" and "OPENCODE_MAX_STEPS" in a.job.detail and "empty reply" not in a.job.detail
@@ -242,7 +242,7 @@ def test_step_cap_is_reported_as_a_warning(world):
 
 
 def test_missing_opencode_binary_fails_with_instructions(world):
-    a = world(opencode_bin="/nonexistent/opencode")
+    a = world(opencode_bin="/nonexistent/opencode", tool_fallback=False)
     a.handle_issue("CA-1")
     assert a.job.status == "failed" and "CODING_BACKEND=aider" in a.job.detail and a.job.error_code == "opencode_missing"
 

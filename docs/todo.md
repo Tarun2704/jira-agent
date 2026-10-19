@@ -17,7 +17,7 @@ fixed"); bigger themes live in [roadmap.md](roadmap.md). Newest first within eac
 
 - [x] ~~Local and Render shared one Redis~~: the local app now has its own Redis and is the live one (see [plan-first.md](plan-first.md) "The current local setup"). When moving to a new host, give it its own Redis too.
 - [x] ~~Host the app off the laptop~~: done 2026-10-14 on Oracle's free 1 GB AMD VM (see [plan-first.md](plan-first.md) "Running on a server"). One job at a time, with swap; slower than a laptop.
-- [ ] **Move to the free ARM VM (2 OCPU / 12 GB) when Oracle has capacity**: the retry job (`~/.oci/jira-agent-vm-retry.sh`, every 10 min, up to 14 days) notifies on success. Then planning and coding can run in parallel again.
+- [ ] **Move to the free ARM VM (1 OCPU / 6 GB, as the stack asks) when Oracle has capacity**: the retry job (`~/.oci/jira-agent-vm-retry.sh`, every 10 min, up to 14 days) notifies on success. Then planning and coding can run in parallel again.
 - [ ] **Upstash command budget** if Redis moves back to Upstash: free tier is 500K commands/month; with the watchdog every 60 s plus `/tick`, set `WATCHDOG_SECONDS=180` or more. (The server's own Redis has no limit.)
 - [x] ~~Production runs GitHub `main`~~ (2026-10-15): the server pulls and builds `main`; `scripts/vm-deploy.sh`. Remove the old copied folder `~/jira-agent.old` on the server once happy.
 - [ ] **Deploy automatically on merge** (optional): a GitHub Action on push to `main` that runs the deploy over SSH (the server's key as a repository secret).
@@ -26,7 +26,8 @@ fixed"); bigger themes live in [roadmap.md](roadmap.md). Newest first within eac
 - [ ] **Render Free + OpenCode planner**: `PLANNER_BACKEND` now defaults to `opencode` (~550 MB per run); on the 512 MB Free instance set `PLANNER_BACKEND=aider` until the instance is upgraded.
 
 - [x] ~~Structured error codes~~: done 2026-10-14, `app/errors.py` (one table: wording, backup model, Retry button, admin alert). Admin alerts are log lines (`ADMIN: ...`) until messages are routed (below).
-- [ ] **Hung jobs**: the watchdog (done) restarts jobs whose process *died*. A job that is alive but stuck keeps refreshing its lease and is only ended by its own timeouts (`OPENCODE_TIMEOUT_SECONDS`, `PLANNER_TIMEOUT_SECONDS`, Aider's). Add an overall time limit per job (e.g. no progress for 3 minutes → stop and re-run once, then fail with a message), checked by the watchdog.
+- [x] ~~Hung jobs~~: done 2026-10-19, `JOB_STUCK_SECONDS` (no sign of life → stopped; OpenCode falls back to Aider, otherwise one automatic re-run, then a failure with Retry). Not covered: a job hanging *outside* a child process (e.g. an HTTP call with no timeout) is only marked stuck; its own timeouts end it.
+- [ ] **Say when queued work starts**: the "waiting for CA-21's coding run" note isn't updated when the job actually starts (the answer replaces it when it's done).
 - [ ] **Post Slack messages outside the job lease**: failed posts are now queued (done), but the retries before queueing still run while the job holds its lease.
 - [x] ~~Backup model for the PR description~~: done 2026-10-14 (`AIDER_FALLBACK_MODEL`, tried once; both calls are counted).
 - [ ] **GitHub webhook instead of polling** for PR merged/closed, reviews and comments (`pull_request`, `pull_request_review`, `pull_request_review_comment`, `issue_comment`): instant instead of up to ~10 minutes, and less API use. Needs an endpoint with signature check (`X-Hub-Signature-256`) and the webhook on the repo; keep `/tick` polling as the safety net. Decide what an **approval** should do (today: nothing; merge completes the ticket).
@@ -52,7 +53,9 @@ Today every Slack message goes to `SLACK_USER_ID`. Target:
 
 - [ ] **Content search for the Aider planner**: rank candidate files by ripgrep hits for the ticket's words, not only by path. Cheap (no model calls) and fixes the "path doesn't match" misses. See [planner-comparison.md](planner-comparison.md).
 - [ ] **`PLANNER_BACKEND=auto`**: Aider on small repos, OpenCode when the repo has more candidate files than the planner's 300-path shortlist. Needs a few more comparisons on big repos first.
-- [ ] **Fall back to the other coding backend** when the *tool* fails (OpenCode missing, out of memory, step limit), not the model.
+- [x] ~~Fall back to the other coding backend when the tool fails~~: done 2026-10-19 (`TOOL_FALLBACK`; planner and coder; OpenCode → Aider only, not the other way).
+- [x] ~~Planner/coder ignoring the ticket's limits~~: done 2026-10-19: the coding step may only change the files the approved plan names.
+- [x] ~~Plan lost when Slack is down~~ and ~~queued messages said nothing~~: done 2026-10-19.
 - [ ] **Route coding by ticket size** (files in the plan, tests needed): only after 10–20 Aider vs OpenCode comparisons, including multi-file tickets. So far: one single-file ticket, where both were correct and Aider used 2 requests vs 9.
 - [ ] **Retry for "no changes"** outcomes, like the new Retry for failed runs.
 - [x] ~~Test scripts in `scripts/`~~: `scripts/compare_planners.py` and `scripts/e2e_faults.py` (done 2026-10-14).

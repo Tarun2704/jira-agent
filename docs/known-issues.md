@@ -78,6 +78,11 @@ Kept here so they aren't reintroduced.
 | "Retry" typed in a thread was answered in the main chat; warnings ignored where you wrote | They used the main chat unconditionally. | Both go where you wrote; the result still comes in the main chat. |
 | "I lost track of this message" while it was only waiting its turn | On a one-job-at-a-time server a reply queued behind a long coding run had no lease, so after 30 min it was declared lost. | Queued jobs count as being worked on. |
 | Replies sent with "Also send to direct message", or with a file attached, were ignored | Slack marks them with a subtype (`thread_broadcast`, `file_share`), and every subtype was dropped. | Both are handled; for files the agent says it reads only the text. |
+| A plan could add changes the ticket ruled out, and the coding step could touch files the plan never mentioned (CA-22) | Nothing compared the change with the approved plan. | The coding agent is told to change only the plan's files, and changes to any other file are undone before the commit (with a warning). The plan itself is what you approve. |
+| A job alive but stuck held the only worker for up to 15 minutes | The watchdog only caught jobs whose process had died. | Jobs report signs of life (steps, output lines, OpenCode events); after `JOB_STUCK_SECONDS` without any, the watchdog kills their processes. OpenCode then falls back to Aider; otherwise the job runs once more by itself before it's reported. |
+| A message waiting behind another ticket's job just said "Looking into it…" for up to 15 minutes | Nothing said it was queued. | The message, the "Started" note and Retry say what they are waiting for. |
+| A plan made while Slack was unreachable was lost, and you were told "I couldn't produce the plan" | The plan post wasn't retried or kept. | It is kept in Redis and posted (marked "Delayed") when Slack answers; one replaced meanwhile isn't posted. |
+| When OpenCode itself failed (crashed, out of memory, stuck), the ticket failed | Only model problems had a fallback. | Aider does that step instead (`TOOL_FALLBACK`, on by default, when Aider is installed). |
 | Tests failed on a developer machine only | Tests read the developer's `.env` (fallback models, backend), which changed the retry path a test exercised. | `tests/conftest.py` blanks those settings. |
 
 ## Troubleshooting

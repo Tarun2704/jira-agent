@@ -80,6 +80,12 @@ if "FAKE_SNEAKY" in prompt:
     step()
     say("Committed it myself.")
     sys.exit(0)
+if "FAKE_TWO" in prompt:  # the planned file, and one the plan doesn't mention
+    open("hello.txt", "w").write("hello from the fake agent\n")
+    open("app.py", "a").write("# touched as well\n")
+    step()
+    say("Created hello.txt and tidied app.py.")
+    sys.exit(0)
 
 # default: do some work
 step(inp=1000, out=50, cost=0.002, cr=200)

@@ -21,7 +21,7 @@ class FakeSlack:
 
     def post(self, text, *, channel="", blocks=None, thread_ts=""):
         self.n += 1
-        ref = {"channel": channel or "D1", "ts": f"1.{self.n}"}
+        ref = {"channel": channel if channel and not channel.startswith("U") else "D1", "ts": f"1.{self.n}"}  # (a user id opens the DM)
         self.posts.append({"text": text, "blocks": blocks, "thread_ts": thread_ts, **ref})
         return ref
 
@@ -1299,3 +1299,113 @@ def test_an_acknowledgement_waiting_in_the_queue_is_not_called_lost(env):
     assert env.wf.tick()["stale"] == []
     env.wf.busy = lambda key: False  # really lost (the process died)
     assert env.wf.tick()["stale"] == ["CA-1"]
+
+
+# ---- queued jobs, stuck jobs, plans during a Slack outage ---------------------------------------------------------
+
+
+def test_a_message_waiting_behind_another_job_says_so(env):
+    env.wf.on_trigger("CA-1")
+    plan_job(env)
+    env.wf.waiting_for = lambda key: ["CA-9's coding run"]
+    env.wf.on_user_message("D1", "", ME, "also mobile", "9.1")
+    ack = env.slack.posts[-1]
+    assert "Looking into it" in ack["text"]
+    assert env.slack.updates[-1]["ts"] == ack["ts"] and "Waiting for CA-9's coding run to finish first" in env.slack.updates[-1]["text"]
+
+
+def test_a_started_run_waiting_behind_another_job_says_so(env):
+    env.wf.on_trigger("CA-1")
+    plan_job(env)
+    env.wf.waiting_for = lambda key: ["CA-9's plan"]
+    approve(env)
+    started = next(p for p in env.slack.posts if "Started CA-1" in p["text"])
+    assert "Waiting for CA-9's plan to finish first" in started["text"]
+
+
+def test_nothing_extra_is_said_when_nothing_is_ahead(env):
+    env.wf.on_trigger("CA-1")
+    plan_job(env)
+    env.wf.on_user_message("D1", "", ME, "also mobile", "9.1")
+    assert not any("Waiting for" in u["text"] for u in env.slack.updates)
+
+
+def test_a_stuck_plan_is_tried_once_more_by_itself_then_reported(env):
+    from app.agent import AgentError
+    stuck = AgentError("Stopped OpenCode: the job made no progress for 7 minute(s) (JOB_STUCK_SECONDS).", code="stuck")
+    env.plans[:] = [stuck, stuck]
+    env.wf.on_trigger("CA-1")
+    job = plan_job(env)
+    s = env.store.get("CA-1")
+    assert job.error_code == "stuck" and s.status == PLANNING and s.stuck_retried
+    assert "trying once more" in env.slack.posts[-1]["text"]
+    env.submitted.clear()
+    env.later[-1][1]()
+    assert env.submitted == [("plan", "CA-1")]
+    plan_job(env)  # stuck again: now it is reported, like any failure
+    s = env.store.get("CA-1")
+    assert s.status == AWAITING_REPLY and "couldn't produce the plan" in env.slack.posts[-1]["text"] and not s.stuck_retried
+
+
+def test_a_stuck_run_is_tried_once_more_by_itself_then_reported(env, monkeypatch):
+    class StuckAgent(RecordingAgent):
+        def handle_issue(self, key):
+            self.job.finish("failed", "Stopped `aider`: the job made no progress for 7 minute(s) (JOB_STUCK_SECONDS).", code="stuck")
+
+    env.plans[:] = [PlanResult("", "## Plan\n1. fix `a.py`", files=["a.py"])]
+    env.wf.on_trigger("CA-1")
+    plan_job(env)
+    approve(env)
+    monkeypatch.setattr(wf_mod, "CodingAgent", StuckAgent)
+    job = Job("CA-1", "x", kind="execute")
+    job.start()
+    env.wf.run_execute_job(job)
+    s = env.store.get("CA-1")
+    assert s.status == EXECUTING and s.stuck_retried and s.rounds == [] and "trying once more" in env.slack.posts[-1]["text"]
+    job = Job("CA-1", "x", kind="execute")
+    job.start()
+    env.wf.run_execute_job(job)  # stuck again
+    s = env.store.get("CA-1")
+    assert s.status == DELIVERED and s.rounds[-1]["outcome"] == "failed" and "got stuck" in env.slack.posts[-1]["text"]
+
+
+def test_a_plan_made_while_slack_is_down_is_kept_and_sent_later(env):
+    real_post = env.slack.post
+
+    def down(text, **k):
+        raise ConnectionError("slack unreachable")
+
+    env.slack.post = down
+    env.wf.on_trigger("CA-1")
+    job = plan_job(env)
+    s = env.store.get("CA-1")
+    assert job.status == "succeeded" and s.status == AWAITING_REPLY and s.plan and s.plan_msg_ts == ""
+    assert "Slack can't be reached" in env.jira.comments[-1][1]
+    env.slack.post = real_post
+    assert env.wf.watchdog()["slack_sent"] == 1
+    s = env.store.get("CA-1")
+    sent = env.slack.posts[-1]
+    assert "Delayed" in str(sent["blocks"]) and "Proceed" in str(sent["blocks"])
+    assert s.plan_msg_ts == sent["ts"] and s.slack_thread_ts == sent["ts"] and s.slack_channel == "D1"
+    assert env.wf.on_action(ACTION_PROCEED, "CA-1", ME, "D1", sent["ts"]) == "confirming"
+
+
+def test_a_held_back_plan_that_was_replaced_meanwhile_is_not_sent(env):
+    env.wf.on_trigger("CA-1")
+    plan_job(env)
+    env.store.queue_slack({"channel": "D1", "text": "Plan v1", "blocks": [], "thread_ts": "", "key": "CA-1", "at": 0, "tries": 0,
+                           "plan_version": 1})
+    env.store.update("CA-1", lambda x: setattr(x, "plan_version", 2))
+    n = len(env.slack.posts)
+    assert env.wf.flush_slack() == 0 and len(env.slack.posts) == n
+
+
+def test_slack_refusing_a_plan_is_still_an_error(env):
+    from app.slack_client import SlackError
+
+    def refuse(text, **k):
+        raise SlackError("chat.postMessage: invalid_blocks")
+
+    env.slack.post = refuse
+    env.wf.on_trigger("CA-1")
+    assert plan_job(env).status == "failed"

@@ -37,6 +37,8 @@ _plan_executor = ThreadPoolExecutor(max_workers=_MAX_PLAN_WORKERS)  # threads; P
 _plan_gate: threading.Semaphore | None = None
 _in_flight: set[str] = set()
 _lock = threading.Lock()
+_order: list[tuple[str, str, str]] = []  # (key, kind, queue) of queued and running jobs, oldest first
+_running: dict[str, Job] = {}  # key -> its job that is running now (the watchdog checks these for being stuck)
 
 
 def _jira() -> JiraClient:
@@ -53,6 +55,7 @@ def _workflow() -> Workflow:
         s = get_settings()
         _wf = Workflow(s, SessionStore.from_url(s.redis_url), SlackClient(s.slack_bot_token, s.slack_user_id), _submit)
         _wf.busy = lambda key: key in _in_flight
+        _wf.waiting_for = _ahead
     return _wf
 
 
@@ -142,6 +145,10 @@ _watchdog_stop = threading.Event()
 def _watchdog_loop(every: int) -> None:
     """Re-queue crashed jobs and re-send held-back Slack messages, independently of /tick (see Workflow.watchdog)."""
     while not _watchdog_stop.wait(every):
+        try:
+            _stop_stuck_jobs()
+        except Exception:
+            log.warning("Checking for stuck jobs failed", exc_info=True)
         try:
             out = _workflow().watchdog()
             if out["requeued"] or out["slack_sent"]:
@@ -254,6 +261,8 @@ def _run_job(job: Job) -> None:
     if use_gate:
         _plan_slot().acquire()  # queued jobs wait here until a planning slot frees up
     job.start()
+    with _lock:
+        _running[job.issue_key] = job
     log.info("Job started (event=%s)", job.event)
     try:
         if job.kind == PLAN_JOB:
@@ -274,11 +283,49 @@ def _run_job(job: Job) -> None:
             _plan_slot().release()
         with _lock:
             _in_flight.discard(job.issue_key)
+            _running.pop(job.issue_key, None)
+            _order[:] = [o for o in _order if o[0] != job.issue_key]
         if job.kind == PLAN_JOB:
             try:  # you may have written again while it was planning
                 _workflow().resume_if_needed(job.issue_key)
             except Exception:
                 log.warning("resume_if_needed failed", exc_info=True)
+
+
+def _ahead(key: str) -> list[str]:
+    """What `key`'s queued job waits for, e.g. ["CA-21's coding run"]; [] if it can start right away."""
+    with _lock:
+        mine = next((o for o in _order if o[0] == key), None)
+        if not mine or key in _running:
+            return []
+        before = []
+        for k, kind, queue in _order:
+            if k == key:
+                break
+            if queue == mine[2]:
+                before.append(f"{k}'s {'plan' if kind == PLAN_JOB else 'coding run'}")
+    try:
+        room = max(1, min(int(get_settings().plan_workers), _MAX_PLAN_WORKERS)) if mine[2] == "plan" else 1
+    except Exception:
+        room = 1
+    return before if len(before) >= room else []
+
+
+def _stop_stuck_jobs() -> list[str]:
+    """Stop running jobs that showed no sign of life for JOB_STUCK_SECONDS (see Job.stop_stuck)."""
+    limit = get_settings().job_stuck_seconds
+    if limit <= 0:
+        return []
+    with _lock:
+        jobs = list(_running.values())
+    stopped = []
+    for job in jobs:
+        if not job.stuck and job.idle_seconds() > limit:
+            killed = job.stop_stuck()
+            log.error("ADMIN: %s made no progress for %ss (step %r); stopped it (%d process(es) killed)",
+                      job.label, limit, job.current_step, killed)
+            stopped.append(job.issue_key)
+    return stopped
 
 
 def _uses_plan_pool() -> bool:
@@ -297,6 +344,8 @@ def _enqueue(key: str, event: str, kind: str = "code") -> Job | None:
     job = Job(issue_key=key, event=event, kind=kind)
     store.add_job(job)
     pool = _plan_executor if kind == PLAN_JOB and _uses_plan_pool() else _executor
+    with _lock:
+        _order.append((key, kind, "plan" if pool is _plan_executor else "coding"))
     log.info("Queued %s (event=%s, queue=%s)", job.label, event, "plan" if pool is _plan_executor else "coding")
     pool.submit(_run_job, job)
     return job

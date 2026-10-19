@@ -86,6 +86,7 @@ class Workflow:
         self._sleep = time.sleep  # (tests replace it)
         self._later = _run_later  # (tests replace it)
         self.busy = lambda key: False  # is a job for this ticket queued or running in this process? (set by main)
+        self.waiting_for = lambda key: []  # what its queued job waits for, e.g. ["CA-21's coding run"] (set by main)
         self.deferred_triggers: set[str] = set()  # tickets whose start failed (Redis down); retried on the next tick
         self._tick_guard = threading.Lock()  # one tick at a time in this process (the Redis lock covers other instances)
 
@@ -140,6 +141,8 @@ class Workflow:
             return 0
         sent = 0
         for i, m in enumerate(pending):
+            if m.get("plan_version") and not self._plan_still_current(m):
+                continue  # a newer plan replaced it meanwhile (or it was approved): never post a stale Proceed button
             note = f":hourglass: _Delayed: Slack couldn't be reached at {time.strftime('%H:%M UTC', time.gmtime(m['at']))}._"
             blocks = [{"type": "context", "elements": [{"type": "mrkdwn", "text": note}]}, *m["blocks"]] if m.get("blocks") else None
             try:
@@ -157,7 +160,42 @@ class Workflow:
             sent += 1
             if m.get("key") and ref:  # replies under the delayed message still find their ticket
                 self.store.map_thread(ref["channel"], ref["ts"], m["key"])
+            if m.get("plan_version") and ref:
+                self._plan_delivered(m["key"], m["plan_version"], ref)
         return sent
+
+    def _plan_still_current(self, m: dict) -> bool:
+        s = self.store.get(m.get("key", ""))
+        return bool(s and s.plan_version == m["plan_version"] and s.status in WAITING | {REVISING})
+
+    def _plan_delivered(self, key: str, version: int, ref: dict) -> None:
+        """A plan held back by a Slack outage was posted: its message becomes the plan message (and the thread)."""
+        def apply(x: Session):
+            if x.plan_version != version:
+                return False
+            x.plan_msg_ts = ref["ts"]
+            if not x.slack_thread_ts:
+                x.slack_channel, x.slack_thread_ts = ref["channel"], ref["ts"]
+
+        self.store.update(key, apply)
+
+    def _post_plan(self, s: Session, text: str, blocks: list, thread_ts: str, version: int) -> dict | None:
+        """Post a plan. If Slack can't be reached it is kept and sent once it can (see flush_slack): the plan isn't
+        lost, and the ticket waits for approval as usual. None then. If Slack answers with an error, that's raised."""
+        for delay in (0, 0.5, 1.5):
+            if delay:
+                self._sleep(delay)
+            try:
+                return self.slack.post(text, channel=s.slack_channel, blocks=blocks, thread_ts=thread_ts)
+            except sc.SlackError:
+                raise  # Slack answered and refused it: not an outage, and waiting won't fix it
+            except Exception:
+                log.warning("Slack post of the plan failed (will retry)", exc_info=True)
+        self.store.queue_slack({"channel": s.slack_channel or self.s.slack_user_id, "text": text, "blocks": blocks,
+                                "thread_ts": thread_ts, "key": s.issue_key, "at": time.time(), "tries": 0,
+                                "plan_version": version})
+        log.warning("Slack unreachable: the plan for %s (v%s) is queued and will be sent when Slack answers", s.issue_key, version)
+        return None
 
     def requeue_orphans(self) -> list[str]:
         """Tickets in a running state whose job no longer holds the lease (the process died): queue the job again."""
@@ -410,11 +448,32 @@ class Workflow:
                 log.exception("Planning failed for %s (%s)", key, kind.code)
                 if kind.admin:
                     log.error("ADMIN: %s needs fixing [%s]: %s", key, kind.code, error[:300])
-                self._plan_failed(s, error, job.id, kind.code)
                 job.finish("failed", error[-500:], code=kind.code)
+                if kind.code == "stuck" and self._again_after_stuck(key, "the plan"):
+                    return  # (still planning: the job is queued again as soon as this one has ended)
+                self._plan_failed(s, error, job.id, kind.code)
             finally:
                 self._save_runs(job, "plan")
                 self._save_cost(job, "plan")
+
+    def _again_after_stuck(self, key: str, what: str) -> bool:
+        """A job stopped because it was stuck: run it once more by itself (the session keeps its state, so the next
+        job picks it up: main's resume_if_needed for plans, the watchdog's requeue for runs). False if it already was."""
+        again = []
+
+        def apply(x: Session):
+            if x.stuck_retried:
+                return False
+            x.stuck_retried = True
+            again.append(True)
+
+        s = self.store.update(key, apply)
+        if not again:
+            return False
+        self._say(s, f":hourglass: I got stuck on {what} for *{key}* (nothing happened for several minutes), so I stopped "
+                     "it and I'm trying once more.", thread_ts=s.reply_to)
+        self._later(3, lambda: self.submit(PLAN_JOB if s.status in (PLANNING, REVISING) else EXECUTE_JOB, key))
+        return True
 
     def _round_context(self, issue, s: Session) -> str:
         """New input for a follow-up round: human comments on the Jira ticket since the last round."""
@@ -483,18 +542,20 @@ class Workflow:
             ref = None
             with job.step("slack_post"):
                 if result.show and not new_round:  # "show me the plan again": the same plan, as a fresh message below your own
-                    ref = self.slack.post(
-                        f"Plan for {key}: {s.title}", channel=s.slack_channel, thread_ts=s.reply_to,
-                        blocks=sc.plan_blocks(key, s.title, s.plan, s.plan_version, bool(s.questions), round_no=s.round_no),
+                    ref = self._post_plan(
+                        s, f"Plan for {key}: {s.title}", sc.plan_blocks(key, s.title, s.plan, s.plan_version, bool(s.questions), round_no=s.round_no),
+                        s.reply_to, s.plan_version,
                     )
-                    self.store.map_thread(ref["channel"], ref["ts"], key)
-                    self._supersede(s, s.plan_version, again=True)
+                    if ref:
+                        self.store.map_thread(ref["channel"], ref["ts"], key)
+                        self._supersede(s, s.plan_version, again=True)
                 self._answer(s, handled["n"], result.reply)
                 warn()
 
             def answered(x: Session):
                 if ref:
                     x.plan_msg_ts = ref["ts"]
+                x.stuck_retried = False
                 remember_reply(x)
                 if x.followup:  # a question after delivery: it stays delivered, nothing new starts
                     x.followup = x.force_plan = False
@@ -523,15 +584,15 @@ class Workflow:
                 said += f" The updated plan (v{version}) is below."
             if result.reply or self._acked(key, handled["n"]):
                 self._answer(s, handled["n"], said)
-            if first:
-                ref = self.slack.post(text, blocks=blocks)
-                self.store.map_thread(ref["channel"], ref["ts"], key)
+            # (the first plan opens the DM; a new version goes right below your message, wherever you wrote it)
+            ref = self._post_plan(s, text, blocks, "" if first else s.reply_to, version)
+            if ref:
+                self.store.map_thread(ref["channel"], ref["ts"], key)  # replies under this plan find their ticket
+            if first and ref:
                 channel, thread_ts = ref["channel"], ref["ts"]
-            else:
-                # the new version goes right below your message, wherever you wrote it
-                ref = self.slack.post(text, channel=s.slack_channel, blocks=blocks, thread_ts=s.reply_to)
-                self.store.map_thread(ref["channel"], ref["ts"], key)  # replies under this version find their ticket
-                channel, thread_ts = s.slack_channel, s.slack_thread_ts
+            else:  # (held back by a Slack outage: flush_slack fills these in when it is posted)
+                channel, thread_ts = s.slack_channel or self.s.slack_user_id, s.slack_thread_ts
+            if not first:
                 if not new_round:  # (the previous round's plan message is already locked as approved)
                     self._supersede(s, version)
             warn()
@@ -539,7 +600,8 @@ class Workflow:
         def finish(x: Session):
             x.plan, x.questions, x.plan_version, x.files = result.body, result.questions, version, result.files
             x.delete_files = list(result.delete_files)
-            x.slack_channel, x.slack_thread_ts, x.plan_msg_ts = channel, thread_ts, ref["ts"]
+            x.slack_channel, x.slack_thread_ts, x.plan_msg_ts = channel, thread_ts, ref["ts"] if ref else ""
+            x.stuck_retried = False
             if new_round:
                 x.round_no, x.followup, x.force_plan = round_no, False, False
                 x.pr_notified = ""
@@ -553,7 +615,10 @@ class Workflow:
             x.touch()
 
         self.store.update(key, finish)
-        if first:
+        if first and not ref:
+            self._jira_comment(key, "🤖 I've drafted a plan, but Slack can't be reached right now; it will be sent there as soon as "
+                                    "it can. Waiting for approval before touching any code.")
+        elif first:
             self._jira_comment(key, "🤖 I've drafted a plan and sent it to Slack. Waiting for approval before touching any code.")
         elif new_round:
             asked = f" Request: {s.round_request[:300]}" if s.round_request else ""
@@ -621,6 +686,7 @@ class Workflow:
 
         def fail(x: Session):
             x.pending_acks = []
+            x.stuck_retried = False
             x.slack_channel, x.slack_thread_ts = channel, thread
             x.handled_upto = len(x.messages)
             if x.followup:  # the ticket stays delivered; nothing new started
@@ -743,6 +809,7 @@ class Workflow:
         note = ":hourglass_flowing_sand: Looking into it..."
         if result == "revise:confirming":
             note = ":hourglass_flowing_sand: Looking into it... (I've paused the start-confirmation; press Proceed again when you're happy.)"
+        ref = None
         try:
             ref = self.slack.post(self._tag(key, note), channel=channel, thread_ts=anchor)
             self.store.map_thread(ref["channel"], ref["ts"], key)
@@ -750,7 +817,25 @@ class Workflow:
         except Exception:
             log.warning("Could not post the acknowledgement for %s", key, exc_info=True)
         self.submit(PLAN_JOB, key)  # a no-op while a plan job is in flight; resume_if_needed catches it
+        queued = self._queued_note(key)
+        if ref and queued:  # say why nothing happens for a while, on the same message
+            text = self._tag(key, f"{note} {queued}")
+            try:
+                self.slack.update(ref["channel"], ref["ts"], text, sc.reply_blocks(text))
+            except Exception:
+                log.warning("Could not add the queue note for %s", key, exc_info=True)
         return result
+
+    def _queued_note(self, key: str) -> str:
+        """" (Waiting for CA-21's coding run to finish first: one job runs at a time.)", or "" if it can start now."""
+        try:
+            ahead = self.waiting_for(key)
+        except Exception:
+            return ""
+        if not ahead:
+            return ""
+        return (f"_(Waiting for {', '.join(ahead[:3])}{' and more' if len(ahead) > 3 else ''} to finish first: "
+                "one job runs at a time.)_")
 
     @staticmethod
     def _can_retry(s: Session) -> bool:
@@ -770,6 +855,7 @@ class Workflow:
                 x.add_message("user", said)
                 x.handled_upto = len(x.messages)
             x.status, x.followup, x.force_plan, x.result = EXECUTING, False, False, ""
+            x.stuck_retried = False
             x.touch()
 
         before = self.store.get(key)
@@ -779,10 +865,11 @@ class Workflow:
             return "ignored_retry"
         if message_ts:  # the button: it can't be pressed twice
             self._update(channel, message_ts, "Retrying.", f":repeat: _Retrying *{key}* with the approved plan..._")
-        self._say(s, f":repeat: *Retrying {key}* with the approved plan (v{s.plan_version}). I'll post the result in the main chat.",
-                  thread_ts=thread_ts)
-        self._jira_comment(key, "🤖 Retrying the approved plan after the previous attempt failed.")
         self.submit(EXECUTE_JOB, key)
+        queued = self._queued_note(key)
+        self._say(s, f":repeat: *Retrying {key}* with the approved plan (v{s.plan_version}). I'll post the result in the main chat."
+                     + (f"\n{queued}" if queued else ""), thread_ts=thread_ts)
+        self._jira_comment(key, "🤖 Retrying the approved plan after the previous attempt failed.")
         return "retrying"
 
     def _completed_text(self, s: Session) -> str:
@@ -857,13 +944,15 @@ class Workflow:
             return "back"
 
         if action_id == sc.ACTION_CONFIRM:
-            moved = self.store.transition(key, CONFIRMING, EXECUTING, delivery_id=uuid.uuid4().hex[:12])
+            moved = self.store.transition(key, CONFIRMING, EXECUTING, delivery_id=uuid.uuid4().hex[:12], stuck_retried=False)
             if not moved:
                 return self._stale_click(key, channel)
             self._lock_plan_message(moved, message_ts)
-            self._say(moved, f":rocket: *Started {key}.* I'll post the pull request here when it's ready. This can't be stopped from Slack yet.")
-            self._jira_comment(key, "🤖 Plan approved in Slack. Starting work now.")
             self.submit(EXECUTE_JOB, key)
+            queued = self._queued_note(key)
+            self._say(moved, f":rocket: *Started {key}.* I'll post the pull request here when it's ready. This can't be stopped from Slack yet."
+                             + (f"\n{queued}" if queued else ""))
+            self._jira_comment(key, "🤖 Plan approved in Slack. Starting work now.")
             return "executing"
         return "unknown_action"
 
@@ -1053,6 +1142,9 @@ class Workflow:
 
     def _finish_execution(self, s: Session, job: Job) -> None:
         """Archive the round and wait for follow-ups: a delivered ticket stays open for FOLLOWUP_DAYS."""
+        if job.status == "failed" and job.error_code == "stuck" and not job.delivery and self._again_after_stuck(s.issue_key, "the code changes"):
+            self._jira_comment(s.issue_key, "🤖 The run got stuck and was stopped; trying it once more.")
+            return  # (still executing: queued again as soon as this job has ended)
         d = job.delivery or {}
         outcome = {"succeeded": "delivered", "no_changes": "no changes", "skipped": "skipped"}.get(job.status, "failed")
         detail = job.pr_url or job.detail or ""
@@ -1077,6 +1169,7 @@ class Workflow:
                 return False
             x.rounds.append(rnd)
             x.status, x.delivered_at, x.followup, x.force_plan, x.result = DELIVERED, time.time(), False, False, detail
+            x.stuck_retried = False
             x.pr_notified, x.review_pending = "", {}
             if d.get("pr_number"):
                 x.pr_number, x.pr_url, x.branch = d["pr_number"], d["pr_url"], d.get("branch", "")

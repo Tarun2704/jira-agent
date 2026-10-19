@@ -90,6 +90,7 @@ This replaces **Step 10 and Step 11** of [how-it-works.md](how-it-works.md). Eve
 | `OPENCODE_PASS_ENV` | empty | Extra environment variable *names* to hand to the agent (comma separated). |
 | `OPENCODE_EXTRA_CONFIG` | empty | JSON merged into the OpenCode config (e.g. a custom provider). |
 | `OPENCODE_BIN` | `opencode` | Path to the executable. |
+| `TOOL_FALLBACK` | `true` | When OpenCode itself fails (crashed or killed for memory, stuck, timed out, couldn't start, or used up its requests without changing anything), Aider does that planning or coding step instead, if Aider is installed (the Docker image has it). Its half-done edits are undone first. Model problems (rate limits, quotas) use the backup model instead. |
 | `PLANNER_BACKEND` | `opencode` | Who writes the plan: `opencode` (read-only run that searches the code; right on big repos, ~3× the requests) or `aider` (~2 requests; finds files by name, fine on small repos). Independent of `CODING_BACKEND`. See [planner-comparison.md](planner-comparison.md). |
 | `OPENCODE_PLANNER_MODEL` | empty | `provider/model` for the OpenCode planner. Empty = `OPENCODE_MODEL`. Its fallback is `OPENCODE_FALLBACK_MODEL`. |
 | `OPENCODE_PLAN_MAX_STEPS` | `20` | Model requests one OpenCode plan may use. |

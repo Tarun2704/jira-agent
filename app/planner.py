@@ -15,7 +15,8 @@ from pathlib import Path
 from app.friendly import explain
 from app.agent import (
     MAX_CONTEXT_FILE_BYTES, MAX_CONTEXT_FILES, AgentError, CodingAgent, coder_empty, coder_problem, llm_problem, merge_files,
-    aider_reply, is_rate_limit, mentioned_files, retryable_llm_problem, strip_credentials,
+    aider_reply, is_rate_limit, mentioned_files, retryable_llm_problem, strip_credentials, tool_failure,
+    can_fall_back,
 )
 from app import opencode_runner as oc
 from app.config import Settings
@@ -543,20 +544,39 @@ class Planner:
             def problem_of(out: str) -> str | None:
                 return coder_problem(out, backend) or stopped_problem(out, self.s)
 
-            def ask(model: str) -> str:
-                if backend == "opencode":
-                    out = a.run_opencode_readonly(
-                        issue, repo_dir, oc.build_plan_prompt(message, files), model=model, step="plan",
-                        timeout=self.s.planner_timeout_seconds, max_steps=self.s.opencode_plan_max_steps,
-                    )
-                    # its tools work with absolute paths, which then show up in the plan ("/tmp/.../CA-7-plan/x.py")
-                    return out.replace(f"{repo_dir.resolve()}/", "").replace(f"{repo_dir}/", "")
+            def ask_aider(model: str) -> str:
                 out = a._run_aider(
                     issue, repo_dir, message=message, model=model, chat_mode="ask",
                     timeout=self.s.planner_timeout_seconds, extra_files=files,
                 )
                 self.job.add_aider(out, model=model, step="plan")
                 return out
+
+            def ask(model: str) -> str:
+                nonlocal backend, main_model, fallback
+                if backend != "opencode":
+                    return ask_aider(model)
+                try:
+                    out = a.run_opencode_readonly(
+                        issue, repo_dir, oc.build_plan_prompt(message, files), model=model, step="plan",
+                        timeout=self.s.planner_timeout_seconds, max_steps=self.s.opencode_plan_max_steps,
+                    )
+                    why = oc.tool_problem(out) if parse(out) is None else None
+                except AgentError as e:
+                    why = tool_failure(e)
+                    if not (why and can_fall_back(self.s)):
+                        raise
+                if why and can_fall_back(self.s):
+                    # OpenCode itself failed (crashed, stuck, out of time or requests): the Aider planner does it, from
+                    # here on (its own models too). A model problem (rate limit...) is not this: see the backup model.
+                    log.warning("OpenCode planner failed (%s); the Aider planner takes over", why)
+                    self.warnings.append(f"The planning tool OpenCode failed ({why}), so Aider wrote this plan instead.")
+                    backend, main_model, fallback = "aider", self.s.effective_planner_model, self.s.planner_fallback_model
+                    self.job.stuck = False
+                    self.job.progress()
+                    return ask_aider(main_model)
+                # its tools work with absolute paths, which then show up in the plan ("/tmp/.../CA-7-plan/x.py")
+                return out.replace(f"{repo_dir.resolve()}/", "").replace(f"{repo_dir}/", "")
 
             chat = chat_style(session)
             parse = parse_chat_output if chat else parse_planner_output

@@ -76,6 +76,8 @@ class Session:
     # Set each time a run is approved or retried, and stamped into that run's commit ("Agent-Delivery: <id>"): a job
     # restarted after a crash checks the branch for it, so work that was already pushed is not done a second time.
     delivery_id: str = ""
+    # The current plan or run was already started once more by itself after getting stuck (only once per attempt).
+    stuck_retried: bool = False
 
     def touch(self) -> None:
         self.last_activity_at = time.time()

@@ -424,7 +424,7 @@ def test_opencode_planner_step_limit_is_explained(monkeypatch, tmp_path):
     from app.agent import AgentError
 
     stopped = "[opencode] model=google/m | model requests=20\n[tool] grep x\n[stopped] step limit reached (20 model requests)"
-    p, _ = _opencode_planner(monkeypatch, tmp_path, stopped)
+    p, _ = _opencode_planner(monkeypatch, tmp_path, stopped, tool_fallback=False)
     with pytest.raises(AgentError, match="OPENCODE_PLAN_MAX_STEPS"):
         p.run(ISSUE, Session("CA-1"))
 

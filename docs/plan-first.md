@@ -24,7 +24,8 @@ If `SLACK_BOT_TOKEN`, `SLACK_USER_ID` or `REDIS_URL` is empty, the old straight-
 | `REDIS_URL` | `rediss://default:<password>@<host>:6379` (Upstash free tier works) |
 | `TICK_TOKEN` | Secret for `GET /tick?token=…` |
 | `PLANNER_MODEL` | Model for plans and revisions. Empty = same as `AIDER_MODEL` |
-| `WATCHDOG_SECONDS` | How often the app re-queues crashed jobs and re-sends Slack messages held back by an outage (default 60; 0 = off) |
+| `WATCHDOG_SECONDS` | How often the app re-queues crashed jobs, stops stuck ones and re-sends Slack messages held back by an outage (default 60; 0 = off) |
+| `JOB_STUCK_SECONDS` | A running job with no sign of life this long (no step, no output line, no agent event) is stopped: OpenCode falls back to Aider, anything else runs once more by itself, then it is reported (default 420; 0 = off) |
 | `PLAN_REMINDER_HOURS` | No reply after this long → Jira comment tagging the reporter (default 48) |
 | `PLAN_WORKERS` | How many plans/revisions run at once (1 to 4, default 1). Each is a clone plus an Aider process (roughly 200-300 MB), so keep 1 on a 512 MB instance |
 | `SEPARATE_PLAN_QUEUE` | `true` (default): plans/revisions have their own worker. `false`: share the single coding worker |
@@ -38,6 +39,14 @@ One JSON session per ticket (status, plan, chat history, Slack thread), a short-
 ## Crash recovery: the watchdog and `/tick`
 
 A running job refreshes its lease every ~100 s. If the process dies, the lease lapses (5 min). The app's own **watchdog** (every `WATCHDOG_SECONDS`, default 60) then sees a session that should be running but has no lease and re-queues it, so recovery takes about 5–6 minutes without anyone calling `/tick`; `/tick` does the same check as a backup. A re-run starts from scratch, which is safe for the same reasons as before (fresh clone, force-pushed `ai/` branch, open-PR check), and a run that had already pushed its commit before dying is recognised by the commit's `Agent-Delivery` stamp and recorded instead of redone. A job that finds the lease taken (another process, or one that just died) tries again when it lapses.
+
+A job that is alive but **stuck** (it keeps its lease, but shows no sign of life for `JOB_STUCK_SECONDS`) is stopped by the same watchdog: its processes are killed. If it was OpenCode, Aider does that step instead (`TOOL_FALLBACK`); otherwise the plan or run starts once more by itself ("I got stuck… trying once more"), and only a second stuck attempt is reported as a failure (with **Retry**).
+
+**What the coding step may change:** only the files the approved plan names (in its steps, its Files section, or files it says to create or delete; a folder like `tests/` covers the files in it). Changes to any other file are undone before the commit, with a warning; if nothing else was changed the run ends as "no changes" and says which files it undid. To change another file, ask for it so the plan includes it.
+
+**Queued work:** on a server that runs one job at a time, a message, an approval or a retry that has to wait says so ("Waiting for CA-21's coding run to finish first").
+
+**Slack down while a plan is made:** the plan is kept and posted (marked "Delayed") as soon as Slack answers; a plan replaced meanwhile is never posted with a live Proceed button.
 
 **Slack outages:** a message that can't be posted after a few tries is kept in Redis and sent by the watchdog once Slack answers again, oldest first, marked "Delayed: Slack couldn't be reached at HH:MM". Results and failures are also written to the Jira ticket straight away, so they aren't late.
 
@@ -77,9 +86,18 @@ there unchanged). The laptop runs nothing; the Render webhook (`coding-agent`) i
 - **First start / after changing `.env`:** copy `.env` to the server (`scp -i ~/.ssh/oracle_jira_agent .env ubuntu@<ip>:~/jira-agent/`),
   then on the server `cd ~/jira-agent && sudo NGROK_AUTHTOKEN=... NGROK_URL=https://...ngrok-free.dev ./scripts/vm-start.sh`.
 - **Production runs GitHub `main`.** The server has a git clone in `~/jira-agent` (its `.env` is git-ignored and stays).
-  To deploy after merging a PR: `./scripts/vm-deploy.sh` from the laptop (fetches `main` on the server, builds, restarts
-  the app; seconds when only app code changed, several minutes when `requirements.txt` changed). `BRANCH=feature/x
-  ./scripts/vm-deploy.sh` tries a pushed branch; deploy `main` again afterwards.
+  **Merging a PR deploys it:** once the Tests workflow passes on `main`, the **Deploy** workflow
+  (`.github/workflows/deploy.yml`) logs into the server and runs `scripts/server-deploy.sh`: it waits for a running job
+  to finish (up to 30 min), fetches `main`, builds and restarts only the app (seconds when only app code changed,
+  several minutes when `requirements.txt` changed). A failed deploy leaves the run red in GitHub's Actions tab.
+  By hand: Actions → Deploy → Run workflow, or `./scripts/vm-deploy.sh` from the laptop (`BRANCH=feature/x` tries a
+  pushed branch; deploy `main` again afterwards; `WAIT_IDLE_SECONDS=0` doesn't wait for running jobs).
+- **The deploy key** (GitHub secret `DEPLOY_SSH_KEY`, with `DEPLOY_HOST` and `DEPLOY_KNOWN_HOSTS`; the laptop keeps it as
+  `~/.ssh/jira_agent_github_deploy`) is a separate key that the server pins to one command in `~/.ssh/authorized_keys`:
+  `command="/home/ubuntu/jira-agent-deploy.sh",no-port-forwarding,no-agent-forwarding,no-X11-forwarding,no-pty ssh-ed25519 ... github-actions-deploy jira-agent`.
+  That wrapper fetches `main` and runs `main`'s own `scripts/server-deploy.sh` (or `~/server-deploy.sh` while `main`
+  doesn't have it yet). Whatever the key asks for, it can only deploy `main` (no shell, no tunnels). To revoke it,
+  delete that line.
 - **1 GB is tight:** the server has a 2 GB swap file and runs **one job at a time** (`SEPARATE_PLAN_QUEUE=false`, set by
   the scripts on servers under ~1.8 GB). Measured: an OpenCode plan peaked at 769 MB of memory plus 313 MB of swap and
   took ~100 s (vs ~45 s on a laptop). Without swap it would be killed.

@@ -12,7 +12,7 @@ from app.checks import CheckResult, format_checks_md, python_syntax_check
 from app.config import Settings
 from app.github_client import GitHubClient
 from app.jira_client import JiraClient, JiraIssue
-from app.jobs import Job
+from app.jobs import Job, JobStuck, run_process
 from app import opencode_runner as oc
 from app.retry import is_transient_git_error, wait_for
 from app.pr_writer import build_pr_body, describe_changes, summary_line, takes_temperature
@@ -122,6 +122,47 @@ def coder_stopped(output: str, backend: str) -> str | None:
     return None
 
 
+_PLAN_PATH = re.compile(r"`([^`\s]+)`")
+
+
+def plan_paths(plan: str) -> set[str]:
+    """Paths an approved plan names: backticked paths (`src/a.py`, a folder like `tests/`) and the entries of its
+    Files and Delete sections, including files it will create. What the coding step may change (see
+    _undo_outside_plan). A plan saying `crime.py` also covers `src/crime.py` (see path_allowed)."""
+    found = {m.group(1) for m in _PLAN_PATH.finditer(plan or "")}
+    for section in re.findall(r"## (?:Files|Delete)[^\n]*\n(.*?)(?=\n## |\Z)", plan or "", flags=re.S):
+        for line in section.splitlines():
+            entry = re.split(r"\s[:\u2014-]\s|:\s|\s\(", line.strip().lstrip("-*0123456789. "), maxsplit=1)[0]
+            found.add(entry.strip("`'\" "))
+    paths = {p.removeprefix("./") for p in found if p and " " not in p and ("." in p or "/" in p)}
+    return {p for p in paths if not p.startswith(("http:", "https:"))}
+
+
+def path_allowed(path: str, allowed: set[str]) -> bool:
+    if path in allowed:
+        return True
+    if any(a.endswith("/") and path.startswith(a) for a in allowed):
+        return True
+    return any("/" not in a and path.rsplit("/", 1)[-1] == a for a in allowed)
+
+
+def can_fall_back(s: Settings) -> bool:
+    """May Aider take over when OpenCode itself fails? TOOL_FALLBACK is on and Aider is installed here (else the
+    original problem is the one to report)."""
+    return s.tool_fallback and shutil.which("aider") is not None
+
+
+def tool_failure(e: Exception) -> str | None:
+    """Why OpenCode itself failed, from the error it raised (None: not a tool failure, e.g. a model problem)."""
+    return {"opencode_missing": "it could not be started", "stuck": "it made no progress",
+            "tool_timeout": "it took too long"}.get(getattr(e, "code", None) or "")
+
+
+def stuck_error(s: Settings, what: str) -> "AgentError":
+    minutes = max(round(s.job_stuck_seconds / 60), 1)
+    return AgentError(f"Stopped {what}: the job made no progress for {minutes} minute(s) (JOB_STUCK_SECONDS).", code="stuck")
+
+
 def strip_credentials(url: str) -> str:
     """https://x-access-token:SECRET@github.com/o/r.git -> https://github.com/o/r.git"""
     return re.sub(r"^(https?://)[^/@]+@", r"\1", url)
@@ -150,7 +191,9 @@ def build_task_prompt(issue: JiraIssue, plan: str = "", history: str = "", delet
     if plan:
         prompt += (
             "The ticket owner has reviewed and approved the plan below, including any clarifications "
-            "from the discussion. Follow it. If the plan and the ticket text disagree, the plan wins.\n\n"
+            "from the discussion. Follow it. If the plan and the ticket text disagree, the plan wins.\n"
+            "Change ONLY the files the plan names, and create only the new files it names. If another file seems to "
+            "need a change, don't change it: say so in your final summary instead (changes to other files are undone).\n\n"
             f"Approved plan:\n{plan}\n\n"
         )
     if deleted:
@@ -285,6 +328,8 @@ class CodingAgent:
         self.followup = followup
         self.deletions = list(deletions or [])  # files the approved plan deletes; removed before Aider runs
         self.deleted: list[str] = []  # the ones actually removed
+        # The backend doing the coding: CODING_BACKEND, until OpenCode itself fails and Aider takes over (TOOL_FALLBACK)
+        self.used_backend = settings.backend
 
     def _apply_deletions(self, repo_dir: Path) -> None:
         """Remove the plan's files with git, first. Only tracked files inside the repo; anything else is reported, not removed."""
@@ -307,7 +352,10 @@ class CodingAgent:
         networked = cmd[0] == "git" and any(c in cmd[:6] for c in ("clone", "push", "fetch", "pull"))
         tries = 3 if networked else 1
         for attempt in range(1, tries + 1):
-            proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+            try:  # (every line it prints counts as progress; the watchdog can stop it if the job is stuck)
+                proc = run_process(cmd, cwd=cwd, timeout=timeout, job=self.job)
+            except JobStuck as e:
+                raise stuck_error(self.s, f"`{self._redact(' '.join(cmd[:2]))}`") from e
             if proc.returncode == 0:
                 return proc.stdout
             out = self._redact(proc.stdout + proc.stderr)
@@ -413,9 +461,10 @@ class CodingAgent:
                 with job.step("delete_files"):
                     self._apply_deletions(repo_dir)
             crlf = crlf_files(repo_dir)
-            backend, cname = self.s.backend, self.s.backend  # "aider" | "opencode": also names the job steps
+            cname = self.s.backend  # "aider" | "opencode": names the job steps
             with job.step(cname):  # the prompt tells the model which files are already gone, so it does the rest of the plan
                 aider_log = self._run_coder(issue, repo_dir, step="code")
+            backend = self.used_backend  # (Aider, if OpenCode itself failed and Aider took over)
             restore_crlf(repo_dir, crlf)
             if self.deleted and coder_problem(aider_log, backend):
                 job.warnings.append("The AI service had a problem, so only the file deletions were made; the rest of the plan was not done. " + explain(coder_problem(aider_log, backend)))
@@ -426,7 +475,8 @@ class CodingAgent:
                 job.warnings.append("The AI service had a problem partway through, so this change may be incomplete. " + explain(coder_problem(aider_log, backend)))
             if not self._git("status", "--porcelain", cwd=repo_dir).strip():
                 first_problem = coder_problem(aider_log, backend)
-                if is_rate_limit(first_problem) and not self.s.coder_fallback_model and self.s.rate_limit_wait_seconds:
+                fallback_model = self.s.aider_fallback_model if backend == "aider" else self.s.opencode_fallback_model
+                if is_rate_limit(first_problem) and not fallback_model and self.s.rate_limit_wait_seconds:
                     log.warning("Rate limited; waiting %ss and trying the same model once more", self.s.rate_limit_wait_seconds)
                     job.warnings.append("The AI service was busy, so I waited a moment and tried again.")
                     time.sleep(self.s.rate_limit_wait_seconds)
@@ -435,13 +485,20 @@ class CodingAgent:
                     restore_crlf(repo_dir, crlf)
                     self._git("add", "-A", cwd=repo_dir)
                     first_problem = coder_problem(aider_log, backend)
-                if retryable_llm_problem(first_problem) and self.s.coder_fallback_model:
-                    log.warning("Main model failed (%s); retrying once with %s", first_problem.splitlines()[0], self.s.coder_fallback_model)
+                if retryable_llm_problem(first_problem) and fallback_model:
+                    log.warning("Main model failed (%s); retrying once with %s", first_problem.splitlines()[0], fallback_model)
                     job.warnings.append("The main AI service wasn't available, so a backup service did the work.")
                     with job.step(f"{cname}_fallback"):
-                        aider_log = self._run_coder(issue, repo_dir, model=self.s.coder_fallback_model, step="code_fallback")
+                        aider_log = self._run_coder(issue, repo_dir, model=fallback_model, step="code_fallback")
+                    backend = self.used_backend
                     restore_crlf(repo_dir, crlf)
                     self._git("add", "-A", cwd=repo_dir)
+            undone = self._undo_outside_plan(repo_dir)
+            if undone and not self._git("status", "--porcelain", cwd=repo_dir).strip():
+                said = (f"The only changes were to files the approved plan doesn't include ({', '.join(undone)}), so I undid "
+                        "them. If those files should change, ask for it and I'll plan it.")
+                self.jira.add_comment(issue_key, f"🤖 I didn't change anything. {said}")
+                return "no_changes", said
             if not self._git("status", "--porcelain", cwd=repo_dir).strip():
                 stopped = coder_stopped(aider_log, backend)
                 problem = coder_problem(aider_log, backend) or ("The model returned an empty reply (possibly blocked by its content filter)." if coder_empty(aider_log, backend) and not stopped else None)
@@ -460,6 +517,8 @@ class CodingAgent:
             log.info("Changed files: %s", self._git("diff", "--cached", "--stat", cwd=repo_dir).strip().replace("\n", " | "))
 
             check, aider_log = self._check_and_fix(issue, repo_dir, crlf, aider_log)
+            if check.retried:
+                self._undo_outside_plan(repo_dir)
             job.checks[check.name] = check.status
             if check.retried and not self._git("status", "--porcelain", cwd=repo_dir).strip():
                 self.jira.add_comment(issue_key, "🤖 Coding agent's fix attempt removed all its changes; nothing to submit.")
@@ -567,8 +626,8 @@ class CodingAgent:
         if result.status != "failed":
             return result, aider_log
 
-        log.warning("Syntax errors, asking %s to fix them: %s", self.s.backend, " | ".join(result.errors))
-        with self.job.step(f"{self.s.backend}_fix"):
+        log.warning("Syntax errors, asking %s to fix them: %s", self.used_backend, " | ".join(result.errors))
+        with self.job.step(f"{self.used_backend}_fix"):
             fix_log = self._run_coder(
                 issue, repo_dir, message=build_fix_prompt(issue, result.errors), files=result.failed_files, step="fix"
             )
@@ -587,9 +646,66 @@ class CodingAgent:
         self, issue: JiraIssue, repo_dir: Path, message: str | None = None, files: list[str] | None = None,
         *, model: str | None = None, step: str = "code",
     ) -> str:
-        """Run the configured coding backend once, record its token use on the job, and return its text log."""
-        if self.s.backend == "opencode":
-            return self._run_opencode(issue, repo_dir, message=message, files=files, model=model, step=step)
+        """Run the coding backend once, record its token use on the job, and return its text log.
+
+        If OpenCode itself fails (crashed, e.g. out of memory; stuck; timed out; not installed; used up its requests
+        without changing anything), Aider does the same step instead, once (TOOL_FALLBACK). Model problems (rate limits,
+        quotas) are not this: they get the backup model in _handle."""
+        if self.used_backend == "opencode":
+            before = self._git("status", "--porcelain", cwd=repo_dir)
+            try:
+                out = self._run_opencode(issue, repo_dir, message=message, files=files, model=model, step=step)
+                why = oc.tool_problem(out)
+                if why == oc.STEP_LIMIT and self._git("status", "--porcelain", cwd=repo_dir) != before:
+                    why = None  # it changed things before it ran out: kept, with a warning (see _run_opencode)
+            except AgentError as e:
+                why = tool_failure(e)
+                if not (why and self._can_fall_back()):
+                    raise
+            if not (why and self._can_fall_back()):
+                return out
+            return self._aider_instead(issue, repo_dir, why, message=message, files=files, step=step)
+        return self._aider_step(issue, repo_dir, message=message, files=files, model=model, step=step)
+
+    def _undo_outside_plan(self, repo_dir: Path) -> list[str]:
+        """With an approved plan, only the files it names may change: undo (and report) changes to any other file.
+        Returns the files undone. Without a plan (the direct flow), or a plan that names no files, nothing is checked."""
+        allowed = plan_paths(self.plan) | set(self.plan_files) | set(self.deletions)
+        if not self.plan or not allowed:
+            return []
+        out = self._git("diff", "--cached", "--name-only", "--no-renames", "-z", cwd=repo_dir)
+        outside = [p for p in out.split("\0") if p and not path_allowed(p, allowed)]
+        for path in outside:
+            if self._git("ls-tree", "--name-only", "HEAD", "--", path, cwd=repo_dir).strip():
+                self._git("restore", "--source=HEAD", "--staged", "--worktree", "--", path, cwd=repo_dir)
+            else:  # a file the agent added
+                self._git("rm", "-q", "--cached", "-f", "--", path, cwd=repo_dir)
+                (repo_dir / path).unlink(missing_ok=True)
+        if outside:
+            log.warning("Undid changes outside the approved plan: %s", ", ".join(outside))
+            self.job.warnings.append(
+                "I undid changes to files the approved plan doesn't include: " + ", ".join(f"`{p}`" for p in outside)
+                + ". If they should change, ask for it and I'll plan it."
+            )
+        return outside
+
+    def _can_fall_back(self) -> bool:
+        return can_fall_back(self.s)
+
+    def _aider_instead(self, issue: JiraIssue, repo_dir: Path, why: str, *, message, files, step: str) -> str:
+        """OpenCode failed as a tool: undo its half-done edits and let Aider do this step (and the rest of the job)."""
+        log.warning("OpenCode failed (%s); Aider does this step instead", why)
+        self.job.warnings.append(f"The coding tool OpenCode failed ({why}), so Aider did the work instead.")
+        # Unstaged edits are OpenCode's; staged ones are the app's (deletions, or an earlier step's accepted work).
+        self._git("checkout", "--", ".", cwd=repo_dir)
+        self._git("clean", "-fdq", cwd=repo_dir)
+        self.used_backend = "aider"
+        self.job.stuck = False
+        self.job.progress()
+        with self.job.step("aider_instead"):
+            return self._aider_step(issue, repo_dir, message=message, files=files, step=f"{step}_aider")
+
+    def _aider_step(self, issue: JiraIssue, repo_dir: Path, *, message=None, files=None, model=None, step: str) -> str:
         kwargs: dict = {}
         if message is not None:
             kwargs["message"] = message
@@ -668,12 +784,13 @@ class CodingAgent:
                     binary=s.opencode_bin, cwd=repo_dir, prompt=prompt, model=model, env=env,
                     config=oc.build_config(allow_bash=s.opencode_allow_bash, extra_json=s.opencode_extra_config),
                     timeout=s.opencode_timeout_seconds, max_steps=s.opencode_max_steps, variant=s.opencode_variant,
-                    title=f"{issue.key} {label}",
+                    title=f"{issue.key} {label}", job=job,
                 )
             except oc.OpenCodeNotInstalled as e:
                 job.record_run(label, record_model, prompt_sent, f"(OpenCode could not start: {e})", ok=False)
                 raise AgentError(
-                    f"OpenCode could not be started ({redact(str(e))}). Install it (the Dockerfile does) or set CODING_BACKEND=aider."
+                    f"OpenCode could not be started ({redact(str(e))}). Install it (the Dockerfile does) or set CODING_BACKEND=aider.",
+                    code="opencode_missing",
                 ) from e
         finally:
             # After the agent: restore git's config byte for byte (this also puts the token URL back for the app's own
@@ -684,9 +801,12 @@ class CodingAgent:
             self._repair_git_state(repo_dir, branch, head)
 
         text = oc.render_log(run, redact)
-        if run.stopped == "timeout":
+        if run.stopped in ("timeout", "stuck"):
+            self._add_opencode_tokens(run, model, step)
             job.record_run(label, record_model, prompt_sent, text, ok=False)
-            raise AgentError(f"OpenCode timed out after {s.opencode_timeout_seconds}s")
+            if run.stopped == "stuck":
+                raise stuck_error(s, "OpenCode")
+            raise AgentError(f"OpenCode timed out after {s.opencode_timeout_seconds}s", code="tool_timeout")
         self._add_opencode_tokens(run, model, step)
         if run.stopped == "max_steps":
             job.warnings.append(
@@ -730,11 +850,12 @@ class CodingAgent:
             run = oc.run_opencode(
                 binary=s.opencode_bin, cwd=repo_dir, prompt=prompt, model=model, env=env,
                 config=oc.build_config(allow_bash=False, read_only=True, extra_json=s.opencode_extra_config),
-                timeout=timeout, max_steps=max_steps, variant=s.opencode_variant, title=f"{issue.key} {step}",
+                timeout=timeout, max_steps=max_steps, variant=s.opencode_variant, title=f"{issue.key} {step}", job=job,
             )
         except oc.OpenCodeNotInstalled as e:
             job.record_run(step, record_model, redact(prompt), f"(OpenCode could not start: {e})", ok=False)
-            raise AgentError(f"OpenCode could not be started ({redact(str(e))}). Install it or set PLANNER_BACKEND=aider.") from e
+            raise AgentError(f"OpenCode could not be started ({redact(str(e))}). Install it or set PLANNER_BACKEND=aider.",
+                             code="opencode_missing") from e
         finally:
             shutil.rmtree(run_dir, ignore_errors=True)
         text = oc.render_log(run, redact)
@@ -742,6 +863,8 @@ class CodingAgent:
         log.info("OpenCode (%s) finished: %d request(s), %d tokens in / %d out, %d tool call(s), %.1fs",
                  step, len(run.steps), run.sent, run.received, len(run.tools), run.duration_s)
         job.record_run(step, record_model, redact(prompt), text, ok=not run.errors and not run.stopped)
+        if run.stopped == "stuck":  # (like the coding step: a stuck run is that, not "an empty reply")
+            raise stuck_error(s, f"OpenCode ({step})")
         return text
 
     def _run_aider(

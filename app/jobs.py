@@ -5,7 +5,9 @@ the logs themselves live in Render's Logs tab.
 """
 import contextvars
 import logging
+import os
 import re
+import signal
 import threading
 import time
 import uuid
@@ -153,6 +155,47 @@ class Job:
     calls: list[dict] = field(default_factory=list)  # each model call: step, model, tokens sent/received (see add_tokens)
     _t0: float = 0.0
 
+    def __post_init__(self) -> None:
+        # Runtime only (not fields, so never stored or shown): when the job last showed signs of life, and the child
+        # processes it is running, so the watchdog can stop a job that is alive but stuck (see Job.stop_stuck).
+        self.last_progress = time.monotonic()
+        self.current_step = "start"  # the step running now (`steps` only holds finished ones)
+        self.stuck = False
+        self._procs: set = set()
+        self._killed: set = set()  # processes stop_stuck killed (only those count as stopped; cleanup still runs)
+        self._procs_lock = threading.Lock()
+
+    def progress(self) -> None:
+        """Something happened (a step started or ended, a child process printed a line, an agent event arrived)."""
+        self.last_progress = time.monotonic()
+
+    def idle_seconds(self) -> float:
+        return time.monotonic() - self.last_progress
+
+    def track(self, proc) -> None:
+        with self._procs_lock:
+            self._procs.add(proc)
+
+    def untrack(self, proc) -> None:
+        with self._procs_lock:
+            self._procs.discard(proc)
+
+    def stop_stuck(self) -> int:
+        """Mark the job stuck and kill its child processes (each with its own children). The job then fails or falls
+        back the normal way, seeing `stuck`. Returns how many processes were killed."""
+        self.stuck = True
+        with self._procs_lock:
+            procs = list(self._procs)
+            self._killed.update(procs)
+        for proc in procs:
+            kill_group(proc)
+        return len(procs)
+
+    def was_stopped(self, proc) -> bool:
+        """Was this process killed because the job was stuck?"""
+        with self._procs_lock:
+            return proc in self._killed
+
     @property
     def label(self) -> str:
         return f"{self.issue_key}#{self.id}"
@@ -168,10 +211,14 @@ class Job:
     @contextmanager
     def step(self, name: str):
         t = time.monotonic()
+        self.progress()
+        outer, self.current_step = self.current_step, name
         try:
             yield
         finally:
             self.steps[name] = round(time.monotonic() - t, 1)
+            self.current_step = outer
+            self.progress()
 
     def record_run(self, step: str, model: str, prompt: str, output: str, ok: bool = True) -> None:
         """Keep what was sent to the model and what came back, for later inspection (/runs/<key>)."""
@@ -214,6 +261,66 @@ class Job:
         d["calls"] = len(d["calls"])  # per-call detail and cost are at /usage/<key>
         d.pop("delivery", None)
         return d
+
+
+class JobStuck(Exception):
+    """A child process was stopped because its job made no progress for too long (see Job.stop_stuck)."""
+
+
+def kill_group(proc) -> None:
+    """Kill a process started with start_new_session=True together with everything it started."""
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
+def run_process(cmd: list[str], *, cwd, timeout: float, job: "Job | None" = None, env: dict | None = None):
+    """subprocess.run(capture_output=True, text=True) for a job: every line printed counts as progress, and the
+    watchdog can kill it (then JobStuck is raised). Raises subprocess.TimeoutExpired after `timeout`, like run()."""
+    import subprocess
+
+    proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True, start_new_session=True)
+    out: dict[str, list[str]] = {"stdout": [], "stderr": []}
+
+    def drain(stream, into: list[str]) -> None:
+        for line in stream:
+            into.append(line)
+            if job:
+                job.progress()
+
+    readers = [threading.Thread(target=drain, args=(proc.stdout, out["stdout"]), daemon=True),
+               threading.Thread(target=drain, args=(proc.stderr, out["stderr"]), daemon=True)]
+    for r in readers:
+        r.start()
+    if job:
+        job.track(proc)
+    timed_out = threading.Event()
+
+    def on_timeout() -> None:
+        timed_out.set()
+        kill_group(proc)
+
+    timer = threading.Timer(timeout, on_timeout)  # (a timer, not wait(timeout), which polls with time.sleep)
+    timer.daemon = True
+    timer.start()
+    try:
+        proc.wait()
+    finally:
+        timer.cancel()
+        if job:
+            job.untrack(proc)
+        for r in readers:
+            r.join(timeout=5)
+    if timed_out.is_set():
+        raise subprocess.TimeoutExpired(cmd, timeout, "".join(out["stdout"]), "".join(out["stderr"]))
+    if job and job.was_stopped(proc):
+        raise JobStuck(" ".join(cmd[:2]))
+    return subprocess.CompletedProcess(cmd, proc.returncode, "".join(out["stdout"]), "".join(out["stderr"]))
 
 
 class JobStore:

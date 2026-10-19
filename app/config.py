@@ -48,6 +48,9 @@ class Settings(BaseSettings):
     opencode_variant: str = ""  # provider-specific reasoning effort (e.g. low/high), passed as --variant. Empty = model default
     opencode_pass_env: str = ""  # extra env var NAMES (comma separated) to hand to the agent, e.g. for a custom provider key
     opencode_extra_config: str = ""  # JSON merged into the generated OpenCode config (e.g. a custom provider)
+    # When OpenCode itself fails (crashed or killed for memory, stuck, timed out, not installed, or used up its requests
+    # without changing anything), Aider does that planning/coding step instead. Model problems use the backup models.
+    tool_fallback: bool = True
 
     # Webhook auth: Jira's HMAC secret, also accepted as ?token=<secret>
     webhook_secret: str
@@ -107,6 +110,10 @@ class Settings(BaseSettings):
     # Every this many seconds the app itself re-queues tickets whose job died (no lease) and re-sends Slack messages
     # that couldn't be delivered. 0 = off (then only /tick does the first, and nothing does the second).
     watchdog_seconds: int = 60
+    # A running job that shows no sign of life this long (no step, no output line, no agent event) is stopped by the
+    # watchdog: its processes are killed, then it falls back to Aider (OpenCode) or is run once more by itself before
+    # it is reported as failed. One model reply can take a few minutes, so keep this well above that. 0 = off.
+    job_stuck_seconds: int = 420
 
     # Cost tracking: prices for the usual models are built in (app/costs.py DEFAULT_PRICES). This adds models or
     # overrides a built-in price: USD per 1M tokens as JSON, {"model name": [input, output]}. Free tiers: [0, 0].

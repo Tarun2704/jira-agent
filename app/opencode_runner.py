@@ -183,7 +183,7 @@ class OpenCodeRun:
     tools: list[str] = field(default_factory=list)  # short description per tool call
     texts: list[str] = field(default_factory=list)  # assistant messages, in order
     errors: list[str] = field(default_factory=list)
-    stopped: str = ""  # "" | "timeout" | "max_steps"
+    stopped: str = ""  # "" | "timeout" | "max_steps" | "stuck" (the watchdog stopped it: no progress)
     stderr_tail: str = ""
     version: str = ""
 
@@ -277,9 +277,11 @@ def known_models(exe: str, provider: str, env: dict[str, str], config: dict) -> 
 
 def run_opencode(
     *, binary: str, cwd: Path, prompt: str, model: str, env: dict[str, str], config: dict,
-    timeout: int, max_steps: int = 0, variant: str = "", title: str = "",
+    timeout: int, max_steps: int = 0, variant: str = "", title: str = "", job=None,
 ) -> OpenCodeRun:
-    """Run `opencode run` once. Raises OpenCodeNotInstalled if the executable is missing; everything else is in the result."""
+    """Run `opencode run` once. Raises OpenCodeNotInstalled if the executable is missing; everything else is in the result.
+
+    With `job`, every event counts as progress and the watchdog can stop the run (`stopped == "stuck"`)."""
     exe = shutil.which(binary, path=env.get("PATH")) or shutil.which(binary)
     if not exe:
         raise OpenCodeNotInstalled(f"`{binary}` was not found on PATH")
@@ -313,9 +315,13 @@ def run_opencode(
     timer = threading.Timer(timeout, on_timeout)
     timer.daemon = True
     timer.start()
+    if job is not None:
+        job.track(proc)
     try:
         assert proc.stdout is not None
         for line in proc.stdout:
+            if job is not None:
+                job.progress()
             line = line.strip()
             if not line.startswith("{"):
                 continue
@@ -331,6 +337,10 @@ def run_opencode(
     finally:
         timer.cancel()
         _kill_group(proc)  # also stops anything the agent left running
+        if job is not None:
+            job.untrack(proc)
+            if job.was_stopped(proc) and not run.stopped:
+                run.stopped = "stuck"
         run.duration_s = round(time.monotonic() - t0, 1)
         run.exit_code = proc.returncode
         try:
@@ -339,6 +349,7 @@ def run_opencode(
         finally:
             err_file.close()
     if not run.errors and run.exit_code not in (0, None) and not run.stopped:
+        # (also what a crash looks like, e.g. killed for using too much memory: exit -9 / 137 and nothing said)
         # e.g. an invalid config: OpenCode prints the reason on stderr and exits with 1 without any JSON event
         run.errors.append(f"OpenCode exited with code {run.exit_code}: {run.stderr_tail[-600:] or '(no message)'}")
     return run
@@ -363,6 +374,8 @@ def render_log(run: OpenCodeRun, redact=lambda s: s) -> str:
         lines.append(f"[stopped] step limit reached ({len(run.steps)} model requests); the work may be incomplete")
     elif run.stopped == "timeout":
         lines.append("[stopped] timed out")
+    elif run.stopped == "stuck":
+        lines.append("[stopped] no progress (stopped by the watchdog)")
     return redact("\n".join(lines))
 
 
@@ -378,6 +391,23 @@ def opencode_problem(log_text: str, classify) -> str | None:
         return (f"OpenCode failed before its first model request and gave no reason (often a model or provider it can't "
                 f"use).\nOpenCode said: {errors[0][:300]}")
     return classify("\n".join(errors)) or f"OpenCode reported an error: {errors[0][:300]}"
+
+
+STEP_LIMIT = "it used up its limit of model requests"
+
+
+def tool_problem(log_text: str) -> str | None:
+    """OpenCode itself failed, as opposed to the model (rate limits etc. are opencode_problem): crashed or was killed
+    (e.g. out of memory), was stopped as stuck, timed out, or used up its requests. Another tool may then succeed."""
+    if "[stopped] no progress" in log_text:
+        return "it made no progress"
+    if "[stopped] timed out" in log_text:
+        return "it took too long"
+    if "[stopped] step limit" in log_text:
+        return STEP_LIMIT
+    if any(ln.startswith("[error] OpenCode exited with code") for ln in log_text.splitlines()):
+        return "it stopped unexpectedly (crashed, or was killed for using too much memory)"
+    return None
 
 
 def opencode_reply(log_text: str, limit: int = 1200) -> str:
